@@ -45,6 +45,16 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+// ---- Seeded PRNG ----
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
 // ---- Game State ----
 let state = 'title';
 let round = 1, pitchesLeft = 10, homeRuns = 0, totalHR = 0;
@@ -62,8 +72,9 @@ let ballTrail = [];
 let impactFlash = 0;
 let crowdFlash = 0;
 let windupTimer = 0;
-let windupPhase = 0; // 0=idle, 1=windup, 2=release
+let windupPhase = 0;
 let frameCount = 0;
+let pitchSpeedDisplay = { text: '', timer: 0 };
 
 // ---- Pitch Types ----
 const PITCH_TYPES = [
@@ -78,332 +89,502 @@ function randomPitch() {
   return { ...pt, mph: pt.name === 'Fastball' ? 93 + Math.floor(Math.random()*6) : pt.name === 'Changeup' ? 80 + Math.floor(Math.random()*6) : 76 + Math.floor(Math.random()*6) };
 }
 
-// ---- Pre-render seat texture for performance ----
-let seatCanvas = null;
-function buildSeatTexture(w, h) {
-  seatCanvas = document.createElement('canvas');
-  seatCanvas.width = w;
-  seatCanvas.height = h;
-  const sc = seatCanvas.getContext('2d');
-  // Fill with dark base
-  sc.fillStyle = '#1a1a28';
-  sc.fillRect(0, 0, w, h);
-  // Draw rows of seats
-  const seatW = 6, seatH = 4, gapX = 2, gapY = 3;
-  const rng = mulberry32(42); // seeded random for consistency
-  for (let y = 0; y < h; y += seatH + gapY) {
-    for (let x = 0; x < w; x += seatW + gapX) {
+// ==============================================================
+// PRE-RENDERED TEXTURES
+// ==============================================================
+
+// ---- Film grain overlay ----
+let grainCanvas = document.createElement('canvas');
+grainCanvas.width = 256; grainCanvas.height = 256;
+(function buildGrain() {
+  const gc = grainCanvas.getContext('2d');
+  const id = gc.createImageData(256, 256);
+  const rng = mulberry32(999);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const v = Math.floor(rng() * 255);
+    id.data[i] = id.data[i+1] = id.data[i+2] = v;
+    id.data[i+3] = 255;
+  }
+  gc.putImageData(id, 0, 0);
+})();
+
+// ---- Crowd / Seat Texture (lower deck - most detail) ----
+let seatCanvasLower = document.createElement('canvas');
+seatCanvasLower.width = 1200; seatCanvasLower.height = 120;
+(function buildLowerSeats() {
+  const sc = seatCanvasLower.getContext('2d');
+  sc.fillStyle = '#0e0a14';
+  sc.fillRect(0, 0, 1200, 120);
+  const rng = mulberry32(42);
+  const seatW = 5, seatH = 3, gapX = 1.5, gapY = 2;
+  for (let y = 0; y < 120; y += seatH + gapY) {
+    for (let x = 0; x < 1200; x += seatW + gapX) {
       const r = rng();
-      // Mostly red seats with some variation for "fans"
-      if (r < 0.55) {
-        sc.fillStyle = '#8B1A1A'; // dark red seat
-      } else if (r < 0.72) {
-        sc.fillStyle = '#A02020'; // medium red
-      } else if (r < 0.82) {
-        // "fan" - slight color variation
-        const colors = ['#C4342E','#9B2020','#7A1818','#B83028','#742222'];
-        sc.fillStyle = colors[Math.floor(r * 100) % colors.length];
-      } else if (r < 0.90) {
-        sc.fillStyle = '#6A1515';
-      } else {
-        // Empty or dark seat
-        sc.fillStyle = '#501010';
+      // More color variety for "fans"
+      if (r < 0.30) sc.fillStyle = '#8B1A1A';
+      else if (r < 0.45) sc.fillStyle = '#A02020';
+      else if (r < 0.52) sc.fillStyle = '#C4342E';
+      else if (r < 0.58) sc.fillStyle = '#cc3333';
+      else if (r < 0.62) sc.fillStyle = '#e8e0d0'; // white shirt fan
+      else if (r < 0.66) sc.fillStyle = '#b0c0d0'; // blue shirt
+      else if (r < 0.69) sc.fillStyle = '#2a2a2a'; // dark jacket
+      else if (r < 0.72) sc.fillStyle = '#d4a030'; // gold shirt
+      else if (r < 0.78) sc.fillStyle = '#7A1818';
+      else if (r < 0.85) sc.fillStyle = '#6A1515';
+      else sc.fillStyle = '#501010';
+      sc.fillRect(x, y, seatW, seatH);
+      // Occasional head highlight
+      if (rng() > 0.7) {
+        sc.fillStyle = `rgba(${140+rng()*60},${100+rng()*50},${80+rng()*40},0.4)`;
+        sc.beginPath();
+        sc.arc(x + seatW/2, y - 0.5, 1.5, 0, Math.PI * 2);
+        sc.fill();
       }
+    }
+  }
+})();
+
+// ---- Upper deck seats (hazier, less detail) ----
+let seatCanvasUpper = document.createElement('canvas');
+seatCanvasUpper.width = 1000; seatCanvasUpper.height = 100;
+(function buildUpperSeats() {
+  const sc = seatCanvasUpper.getContext('2d');
+  sc.fillStyle = '#12101e';
+  sc.fillRect(0, 0, 1000, 100);
+  const rng = mulberry32(77);
+  const seatW = 4, seatH = 2.5, gapX = 1, gapY = 1.5;
+  for (let y = 0; y < 100; y += seatH + gapY) {
+    for (let x = 0; x < 1000; x += seatW + gapX) {
+      const r = rng();
+      if (r < 0.40) sc.fillStyle = '#5a1212';
+      else if (r < 0.60) sc.fillStyle = '#6A1818';
+      else if (r < 0.70) sc.fillStyle = '#4a0e0e';
+      else if (r < 0.78) sc.fillStyle = '#7a2020';
+      else sc.fillStyle = '#3a0a0a';
       sc.fillRect(x, y, seatW, seatH);
     }
   }
-  return seatCanvas;
-}
+  // Atmospheric haze over upper deck
+  sc.fillStyle = 'rgba(30,35,60,0.35)';
+  sc.fillRect(0, 0, 1000, 100);
+})();
 
-// Seeded random for consistent seat patterns
-function mulberry32(a) {
-  return function() {
-    a |= 0; a = a + 0x6D2B79F5 | 0;
-    var t = Math.imul(a ^ a >>> 15, 1 | a);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
+// ---- Dirt noise texture ----
+let dirtNoiseCanvas = document.createElement('canvas');
+dirtNoiseCanvas.width = 512; dirtNoiseCanvas.height = 512;
+(function buildDirtNoise() {
+  const dc = dirtNoiseCanvas.getContext('2d');
+  const id = dc.createImageData(512, 512);
+  const rng = mulberry32(333);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const base = 120 + rng() * 60;
+    id.data[i] = base + 20;
+    id.data[i+1] = base - 10;
+    id.data[i+2] = base - 40;
+    id.data[i+3] = 18;
+  }
+  dc.putImageData(id, 0, 0);
+})();
 
-// Build seat texture on load
-const seatTex = buildSeatTexture(800, 200);
+// ---- Grass noise texture ----
+let grassNoiseCanvas = document.createElement('canvas');
+grassNoiseCanvas.width = 512; grassNoiseCanvas.height = 512;
+(function buildGrassNoise() {
+  const gc = grassNoiseCanvas.getContext('2d');
+  const id = gc.createImageData(512, 512);
+  const rng = mulberry32(555);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const v = rng() * 30;
+    id.data[i] = 10 + v * 0.3;
+    id.data[i+1] = 60 + v;
+    id.data[i+2] = 10 + v * 0.2;
+    id.data[i+3] = 15;
+  }
+  gc.putImageData(id, 0, 0);
+})();
 
-// ---- Drawing Helpers ----
+// ==============================================================
+// DRAWING - SKY
+// ==============================================================
 
 function drawSky() {
-  // Evening sky gradient - deep and rich
-  const g = ctx.createLinearGradient(0, 0, 0, H * 0.42);
-  g.addColorStop(0, '#05081a');
-  g.addColorStop(0.2, '#0a1235');
-  g.addColorStop(0.45, '#142252');
-  g.addColorStop(0.7, '#1e3a6e');
-  g.addColorStop(0.85, '#2a4a78');
-  g.addColorStop(0.95, '#4a5a6a');
-  g.addColorStop(1, '#6a5544');
+  // Deep night sky - navy to warm dark blue-purple at horizon
+  const g = ctx.createLinearGradient(0, 0, 0, H * 0.44);
+  g.addColorStop(0, '#020510');
+  g.addColorStop(0.10, '#040a1a');
+  g.addColorStop(0.25, '#08122e');
+  g.addColorStop(0.45, '#101e48');
+  g.addColorStop(0.65, '#1a2a58');
+  g.addColorStop(0.80, '#253262');
+  g.addColorStop(0.90, '#34385a');
+  g.addColorStop(0.96, '#4a3e52');
+  g.addColorStop(1, '#5a4844');
   ctx.fillStyle = g;
-  ctx.fillRect(0, 0, W, H * 0.45);
+  ctx.fillRect(0, 0, W, H * 0.46);
 
-  // Stars
+  // Stars - very tiny and subtle
   const rng = mulberry32(123);
-  ctx.fillStyle = '#fff';
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 180; i++) {
     const sx = rng() * W;
-    const sy = rng() * H * 0.25;
-    const brightness = 0.15 + rng() * 0.5;
-    const sz = 0.5 + rng() * 1.5;
-    // Subtle twinkle
-    const twinkle = 0.7 + 0.3 * Math.sin(frameCount * 0.02 + i * 2.7);
+    const sy = rng() * H * 0.28;
+    const brightness = 0.08 + rng() * 0.35;
+    const sz = 0.3 + rng() * 1.2;
+    const twinkle = 0.7 + 0.3 * Math.sin(frameCount * 0.015 + i * 2.7);
     ctx.globalAlpha = brightness * twinkle;
+    ctx.fillStyle = rng() > 0.85 ? '#d0d8ff' : '#ffffff';
     ctx.beginPath();
     ctx.arc(sx, sy, sz, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
 
-  // Wispy clouds with depth
-  for (let i = 0; i < 5; i++) {
+  // Very faint atmospheric wisps (not cartoon clouds)
+  for (let i = 0; i < 6; i++) {
     const rng2 = mulberry32(i * 77 + 31);
     const cx = rng2() * W;
-    const cy = 30 + rng2() * 80;
-    const cw = 180 + rng2() * 250;
-    const ch = 12 + rng2() * 18;
+    const cy = 30 + rng2() * 100;
+    const cw = 200 + rng2() * 350;
+    const ch = 8 + rng2() * 14;
     const cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, cw);
-    cg.addColorStop(0, 'rgba(140,150,180,0.06)');
-    cg.addColorStop(0.5, 'rgba(120,130,160,0.03)');
-    cg.addColorStop(1, 'rgba(100,110,140,0)');
+    cg.addColorStop(0, 'rgba(100,110,140,0.035)');
+    cg.addColorStop(0.5, 'rgba(80,90,120,0.015)');
+    cg.addColorStop(1, 'rgba(60,70,100,0)');
     ctx.fillStyle = cg;
     ctx.beginPath();
-    ctx.ellipse(cx, cy, cw, ch, 0.1 * i, 0, Math.PI * 2);
-    ctx.fill();
-    // Second layer for depth
-    ctx.fillStyle = 'rgba(160,170,200,0.025)';
-    ctx.beginPath();
-    ctx.ellipse(cx + 40, cy - 5, cw * 0.6, ch * 0.7, -0.05, 0, Math.PI * 2);
+    ctx.ellipse(cx, cy, cw, ch, 0.08 * i, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  // Horizon glow (sunset remnant)
-  const hg = ctx.createLinearGradient(0, H * 0.32, 0, H * 0.44);
-  hg.addColorStop(0, 'rgba(120,80,40,0)');
-  hg.addColorStop(0.5, 'rgba(140,90,50,0.08)');
-  hg.addColorStop(1, 'rgba(100,70,40,0.04)');
+  // Warm horizon glow (golden hour remnant)
+  const hg = ctx.createLinearGradient(0, H * 0.33, 0, H * 0.46);
+  hg.addColorStop(0, 'rgba(100,60,30,0)');
+  hg.addColorStop(0.4, 'rgba(130,80,40,0.06)');
+  hg.addColorStop(0.7, 'rgba(120,75,35,0.04)');
+  hg.addColorStop(1, 'rgba(80,55,30,0.02)');
   ctx.fillStyle = hg;
-  ctx.fillRect(0, H * 0.32, W, H * 0.12);
+  ctx.fillRect(0, H * 0.33, W, H * 0.13);
+
+  // Subtle purple-blue atmospheric glow band
+  const pg = ctx.createLinearGradient(0, H * 0.30, 0, H * 0.42);
+  pg.addColorStop(0, 'rgba(60,40,80,0)');
+  pg.addColorStop(0.5, 'rgba(50,35,70,0.04)');
+  pg.addColorStop(1, 'rgba(40,30,60,0)');
+  ctx.fillStyle = pg;
+  ctx.fillRect(0, H * 0.30, W, H * 0.12);
 }
+
+// ==============================================================
+// DRAWING - GATEWAY ARCH
+// ==============================================================
 
 function drawArch() {
-  // Gateway Arch - properly proportioned stainless steel with reflections
   ctx.save();
-  const archCx = 1240, archBase = 210, archH = 195, archW = 105;
+  const archCx = 1250, archBase = 215, archH = 200, archW = 108;
 
-  // Arch glow behind
-  const archGlow = ctx.createRadialGradient(archCx, archBase - archH * 0.5, 10, archCx, archBase - archH * 0.3, archH);
-  archGlow.addColorStop(0, 'rgba(180,200,220,0.06)');
-  archGlow.addColorStop(1, 'rgba(180,200,220,0)');
+  // Soft atmospheric glow behind arch
+  const archGlow = ctx.createRadialGradient(archCx, archBase - archH * 0.45, 8, archCx, archBase - archH * 0.3, archH * 1.1);
+  archGlow.addColorStop(0, 'rgba(160,175,200,0.06)');
+  archGlow.addColorStop(0.5, 'rgba(140,155,180,0.025)');
+  archGlow.addColorStop(1, 'rgba(120,135,160,0)');
   ctx.fillStyle = archGlow;
   ctx.beginPath();
-  ctx.arc(archCx, archBase - archH * 0.3, archH, 0, Math.PI * 2);
+  ctx.arc(archCx, archBase - archH * 0.3, archH * 1.1, 0, Math.PI * 2);
   ctx.fill();
 
-  // Draw arch with metallic gradient - thicker and more detailed
-  for (let pass = 0; pass < 3; pass++) {
-    const offset = (pass - 1) * 2;
-    ctx.beginPath();
-    for (let t = -1; t <= 1; t += 0.01) {
-      const x = archCx + t * archW + offset;
-      // Catenary approximation
-      const y = archBase - archH * (1 - t * t * t * t);
-      if (t === -1) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-
-    if (pass === 0) {
-      // Dark shadow edge
-      ctx.strokeStyle = 'rgba(60,70,80,0.5)';
-      ctx.lineWidth = 10;
-    } else if (pass === 1) {
-      // Main metallic body
-      const mg = ctx.createLinearGradient(archCx - archW, 0, archCx + archW, 0);
-      mg.addColorStop(0, '#606878');
-      mg.addColorStop(0.2, '#8890a0');
-      mg.addColorStop(0.35, '#b8c0d0');
-      mg.addColorStop(0.5, '#d0d8e8');
-      mg.addColorStop(0.65, '#b0b8c8');
-      mg.addColorStop(0.8, '#8890a0');
-      mg.addColorStop(1, '#606878');
-      ctx.strokeStyle = mg;
-      ctx.lineWidth = 7;
-    } else {
-      // Highlight edge
-      ctx.strokeStyle = 'rgba(220,230,250,0.25)';
-      ctx.lineWidth = 2;
-    }
-    ctx.stroke();
+  // Catenary curve: y = a * cosh(x/a) - a, where a = archH
+  // For proper catenary: normalized so arch is 630x630
+  function archY(t) {
+    // t from -1 to 1, catenary approximation
+    const cosh = (x) => (Math.exp(x) + Math.exp(-x)) / 2;
+    const a = 1.0;
+    const raw = cosh(t * 1.8) / cosh(1.8);
+    return archBase - archH * (1 - raw);
   }
+
+  // Pass 1: Wide dark shadow
+  ctx.beginPath();
+  for (let t = -1; t <= 1; t += 0.008) {
+    const x = archCx + t * archW;
+    const y = archY(t);
+    if (t === -1) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = 'rgba(20,25,35,0.6)';
+  ctx.lineWidth = 13;
+  ctx.stroke();
+
+  // Pass 2: Main metallic body with multi-stop gradient
+  ctx.beginPath();
+  for (let t = -1; t <= 1; t += 0.008) {
+    const x = archCx + t * archW;
+    const y = archY(t);
+    if (t === -1) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  const mg = ctx.createLinearGradient(archCx - archW, 0, archCx + archW, 0);
+  mg.addColorStop(0, '#484f5e');
+  mg.addColorStop(0.12, '#687080');
+  mg.addColorStop(0.22, '#8890a2');
+  mg.addColorStop(0.32, '#a8b0c4');
+  mg.addColorStop(0.40, '#c8d0e2');
+  mg.addColorStop(0.48, '#dce4f0');
+  mg.addColorStop(0.55, '#c8d0e2');
+  mg.addColorStop(0.65, '#a0a8b8');
+  mg.addColorStop(0.78, '#787f90');
+  mg.addColorStop(0.88, '#606878');
+  mg.addColorStop(1, '#484f5e');
+  ctx.strokeStyle = mg;
+  ctx.lineWidth = 8;
+  ctx.stroke();
+
+  // Pass 3: Bright highlight on upper-left (moonlight reflection)
+  ctx.beginPath();
+  for (let t = -0.85; t <= 0.1; t += 0.008) {
+    const x = archCx + t * archW - 2;
+    const y = archY(t) - 1;
+    if (t <= -0.85 + 0.008) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = 'rgba(220,230,250,0.3)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Pass 4: Thin dark edge on right
+  ctx.beginPath();
+  for (let t = 0.1; t <= 1; t += 0.008) {
+    const x = archCx + t * archW + 3;
+    const y = archY(t) + 1;
+    if (t <= 0.1 + 0.008) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = 'rgba(30,35,45,0.4)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
 
   // Base foundations
-  ctx.fillStyle = '#505868';
-  ctx.fillRect(archCx - archW - 4, archBase - 2, 10, 14);
-  ctx.fillRect(archCx + archW - 6, archBase - 2, 10, 14);
+  ctx.fillStyle = '#3a3f4e';
+  ctx.fillRect(archCx - archW - 5, archBase - 2, 12, 16);
+  ctx.fillRect(archCx + archW - 7, archBase - 2, 12, 16);
+  // Foundation highlight
+  ctx.fillStyle = 'rgba(160,170,190,0.2)';
+  ctx.fillRect(archCx - archW - 4, archBase - 1, 10, 3);
+  ctx.fillRect(archCx + archW - 6, archBase - 1, 10, 3);
 
   ctx.restore();
 }
+
+// ==============================================================
+// DRAWING - STADIUM STRUCTURE
+// ==============================================================
 
 function drawStadiumStructure() {
-  // ---- Canopy/roof line at top ----
-  ctx.fillStyle = '#0e0e18';
+  // ---- Canopy / ribbon at top (Busch signature) ----
+  // Dark canopy with subtle metallic sheen
+  const canopyG = ctx.createLinearGradient(0, 185, 0, 215);
+  canopyG.addColorStop(0, '#08080e');
+  canopyG.addColorStop(0.3, '#12121e');
+  canopyG.addColorStop(0.5, '#181825');
+  canopyG.addColorStop(0.7, '#12121e');
+  canopyG.addColorStop(1, '#0a0a14');
+  ctx.fillStyle = canopyG;
   ctx.beginPath();
-  ctx.moveTo(0, 195);
-  ctx.lineTo(160, 195);
-  ctx.lineTo(180, 200);
-  ctx.lineTo(1740, 200);
-  ctx.lineTo(1760, 195);
-  ctx.lineTo(W, 195);
-  ctx.lineTo(W, 210);
-  ctx.lineTo(0, 210);
+  ctx.moveTo(0, 192);
+  ctx.lineTo(140, 192);
+  // Distinctive wave shape
+  ctx.quadraticCurveTo(200, 196, 300, 198);
+  ctx.lineTo(1620, 198);
+  ctx.quadraticCurveTo(1720, 196, 1780, 192);
+  ctx.lineTo(W, 192);
+  ctx.lineTo(W, 215);
+  ctx.lineTo(0, 215);
+  ctx.closePath();
+  ctx.fill();
+  // Canopy edge highlight
+  ctx.strokeStyle = 'rgba(80,90,110,0.3)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 192);
+  ctx.lineTo(140, 192);
+  ctx.quadraticCurveTo(200, 196, 300, 198);
+  ctx.lineTo(1620, 198);
+  ctx.quadraticCurveTo(1720, 196, 1780, 192);
+  ctx.lineTo(W, 192);
+  ctx.stroke();
+
+  // ---- UPPER DECK ----
+  ctx.save();
+  const udG = ctx.createLinearGradient(0, 215, 0, 330);
+  udG.addColorStop(0, '#0e0e1e');
+  udG.addColorStop(0.3, '#161628');
+  udG.addColorStop(0.7, '#1a1a2c');
+  udG.addColorStop(1, '#141422');
+  ctx.fillStyle = udG;
+  ctx.beginPath();
+  ctx.moveTo(70, 335);
+  ctx.lineTo(150, 215);
+  ctx.lineTo(1770, 215);
+  ctx.lineTo(1850, 335);
   ctx.closePath();
   ctx.fill();
 
-  // ---- Upper deck ----
-  ctx.save();
-  const ug = ctx.createLinearGradient(0, 210, 0, 320);
-  ug.addColorStop(0, '#1a1a2a');
-  ug.addColorStop(0.5, '#222236');
-  ug.addColorStop(1, '#1a1a28');
-  ctx.fillStyle = ug;
-  ctx.beginPath();
-  ctx.moveTo(80, 330);
-  ctx.lineTo(160, 210);
-  ctx.lineTo(1760, 210);
-  ctx.lineTo(1840, 330);
-  ctx.closePath();
-  ctx.fill();
-
-  // Draw seats in upper deck using texture
+  // Upper deck seat texture
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(80, 330);
-  ctx.lineTo(160, 210);
-  ctx.lineTo(1760, 210);
-  ctx.lineTo(1840, 330);
+  ctx.moveTo(70, 335);
+  ctx.lineTo(150, 215);
+  ctx.lineTo(1770, 215);
+  ctx.lineTo(1850, 335);
   ctx.closePath();
   ctx.clip();
-  ctx.globalAlpha = 0.7;
-  // Tile the seat texture
-  const pat1 = ctx.createPattern(seatTex, 'repeat');
+  ctx.globalAlpha = 0.65;
+  const pat1 = ctx.createPattern(seatCanvasUpper, 'repeat');
   ctx.fillStyle = pat1;
-  ctx.fillRect(80, 210, 1760, 130);
+  ctx.fillRect(70, 215, 1780, 125);
   ctx.globalAlpha = 1;
+
+  // Atmospheric haze over upper deck (depth of field)
+  const udHaze = ctx.createLinearGradient(0, 215, 0, 335);
+  udHaze.addColorStop(0, 'rgba(25,30,50,0.45)');
+  udHaze.addColorStop(0.5, 'rgba(20,25,45,0.30)');
+  udHaze.addColorStop(1, 'rgba(18,20,38,0.20)');
+  ctx.fillStyle = udHaze;
+  ctx.fillRect(70, 215, 1780, 125);
   ctx.restore();
 
-  // Concrete fascia between upper and club
-  const fg1 = ctx.createLinearGradient(0, 328, 0, 345);
-  fg1.addColorStop(0, '#3a3a48');
-  fg1.addColorStop(0.5, '#4a4a58');
-  fg1.addColorStop(1, '#3a3a48');
+  // Concrete fascia upper/club
+  const fg1 = ctx.createLinearGradient(0, 332, 0, 350);
+  fg1.addColorStop(0, '#2a2a38');
+  fg1.addColorStop(0.2, '#3d3d50');
+  fg1.addColorStop(0.5, '#484860');
+  fg1.addColorStop(0.8, '#3d3d50');
+  fg1.addColorStop(1, '#2a2a38');
   ctx.fillStyle = fg1;
   ctx.beginPath();
-  ctx.moveTo(80, 330);
-  ctx.lineTo(1840, 330);
-  ctx.lineTo(1830, 345);
-  ctx.lineTo(90, 345);
+  ctx.moveTo(70, 335);
+  ctx.lineTo(1850, 335);
+  ctx.lineTo(1840, 350);
+  ctx.lineTo(80, 350);
   ctx.closePath();
   ctx.fill();
+  // Shadow on bottom of fascia
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(80, 348, 1760, 3);
 
-  // ---- Club level ----
-  const cg = ctx.createLinearGradient(0, 345, 0, 385);
-  cg.addColorStop(0, '#1e1e30');
-  cg.addColorStop(1, '#242440');
-  ctx.fillStyle = cg;
+  // ---- CLUB / SUITE LEVEL ----
+  const clG = ctx.createLinearGradient(0, 350, 0, 395);
+  clG.addColorStop(0, '#141428');
+  clG.addColorStop(0.5, '#1a1a34');
+  clG.addColorStop(1, '#161630');
+  ctx.fillStyle = clG;
   ctx.beginPath();
-  ctx.moveTo(90, 345);
-  ctx.lineTo(1830, 345);
-  ctx.lineTo(1815, 385);
-  ctx.lineTo(105, 385);
+  ctx.moveTo(80, 350);
+  ctx.lineTo(1840, 350);
+  ctx.lineTo(1825, 395);
+  ctx.lineTo(95, 395);
   ctx.closePath();
   ctx.fill();
 
-  // Club level windows/suites
-  ctx.fillStyle = 'rgba(100,120,160,0.15)';
-  for (let x = 130; x < 1800; x += 25) {
-    ctx.fillRect(x, 350, 15, 28);
+  // Suite windows - warm interior glow
+  for (let x = 120; x < 1810; x += 22) {
+    const rng = mulberry32(x * 13 + 7);
+    const warmth = rng();
+    if (warmth > 0.4) {
+      // Lit window
+      const wg = ctx.createLinearGradient(x, 356, x, 386);
+      wg.addColorStop(0, `rgba(${80+warmth*40},${70+warmth*30},${50+warmth*20},0.15)`);
+      wg.addColorStop(1, `rgba(${60+warmth*30},${50+warmth*20},${35+warmth*15},0.08)`);
+      ctx.fillStyle = wg;
+    } else {
+      ctx.fillStyle = 'rgba(40,45,70,0.12)';
+    }
+    ctx.fillRect(x, 356, 14, 30);
+    // Window frame
+    ctx.strokeStyle = 'rgba(60,65,85,0.15)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(x, 356, 14, 30);
   }
 
-  // Concrete fascia between club and lower
-  const fg2 = ctx.createLinearGradient(0, 383, 0, 398);
-  fg2.addColorStop(0, '#3a3a48');
-  fg2.addColorStop(0.5, '#4a4a58');
-  fg2.addColorStop(1, '#3a3a48');
+  // Concrete fascia club/lower
+  const fg2 = ctx.createLinearGradient(0, 393, 0, 408);
+  fg2.addColorStop(0, '#2a2a38');
+  fg2.addColorStop(0.3, '#3d3d50');
+  fg2.addColorStop(0.6, '#484860');
+  fg2.addColorStop(1, '#2a2a38');
   ctx.fillStyle = fg2;
   ctx.beginPath();
-  ctx.moveTo(105, 385);
-  ctx.lineTo(1815, 385);
-  ctx.lineTo(1805, 398);
-  ctx.lineTo(115, 398);
+  ctx.moveTo(95, 395);
+  ctx.lineTo(1825, 395);
+  ctx.lineTo(1815, 408);
+  ctx.lineTo(105, 408);
   ctx.closePath();
   ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(105, 406, 1710, 3);
 
-  // ---- Lower deck ----
-  const lg = ctx.createLinearGradient(0, 398, 0, 445);
-  lg.addColorStop(0, '#1e1e30');
-  lg.addColorStop(1, '#222238');
-  ctx.fillStyle = lg;
+  // ---- LOWER DECK (closest, most detail) ----
+  const ldG = ctx.createLinearGradient(0, 408, 0, 455);
+  ldG.addColorStop(0, '#121224');
+  ldG.addColorStop(0.5, '#181832');
+  ldG.addColorStop(1, '#141428');
+  ctx.fillStyle = ldG;
   ctx.beginPath();
-  ctx.moveTo(115, 398);
-  ctx.lineTo(1805, 398);
-  ctx.lineTo(1790, 445);
-  ctx.lineTo(130, 445);
+  ctx.moveTo(105, 408);
+  ctx.lineTo(1815, 408);
+  ctx.lineTo(1800, 455);
+  ctx.lineTo(120, 455);
   ctx.closePath();
   ctx.fill();
 
-  // Draw seats in lower deck
+  // Lower deck seat texture (most detail)
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(115, 398);
-  ctx.lineTo(1805, 398);
-  ctx.lineTo(1790, 445);
-  ctx.lineTo(130, 445);
+  ctx.moveTo(105, 408);
+  ctx.lineTo(1815, 408);
+  ctx.lineTo(1800, 455);
+  ctx.lineTo(120, 455);
   ctx.closePath();
   ctx.clip();
-  ctx.globalAlpha = 0.8;
-  const pat2 = ctx.createPattern(seatTex, 'repeat');
+  ctx.globalAlpha = 0.85;
+  const pat2 = ctx.createPattern(seatCanvasLower, 'repeat');
   ctx.fillStyle = pat2;
-  ctx.fillRect(115, 398, 1700, 50);
+  ctx.fillRect(105, 408, 1710, 50);
   ctx.globalAlpha = 1;
   ctx.restore();
 
   ctx.restore();
 
-  // Crowd flash on home run
+  // ---- Crowd flash on HR ----
   if (crowdFlash > 0) {
-    ctx.globalAlpha = crowdFlash * 0.15;
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(80, 210, 1760, 240);
+    ctx.globalAlpha = crowdFlash * 0.12;
+    ctx.fillStyle = '#ffe8c0';
+    ctx.fillRect(70, 215, 1780, 245);
     ctx.globalAlpha = 1;
-    crowdFlash -= 0.02;
+    crowdFlash -= 0.015;
   }
 }
 
-function drawScoreboard() {
-  // LED scoreboard - like Busch Stadium video board in left-center
-  const sbX = 320, sbY = 260, sbW = 220, sbH = 90;
+// ==============================================================
+// SCOREBOARD (LED board in left-center)
+// ==============================================================
 
-  // Board backing
-  ctx.fillStyle = '#0a0a14';
+function drawScoreboard() {
+  const sbX = 310, sbY = 265, sbW = 230, sbH = 95;
+
+  // Board backing with subtle depth
+  const sbg = ctx.createLinearGradient(sbX, sbY, sbX, sbY + sbH);
+  sbg.addColorStop(0, '#06060e');
+  sbg.addColorStop(0.5, '#0a0a18');
+  sbg.addColorStop(1, '#060610');
+  ctx.fillStyle = sbg;
   ctx.fillRect(sbX, sbY, sbW, sbH);
 
-  // Border - subtle LED frame
-  ctx.strokeStyle = '#1a1a3a';
+  // Border - LED frame glow
+  ctx.strokeStyle = '#1a1a38';
   ctx.lineWidth = 3;
   ctx.strokeRect(sbX, sbY, sbW, sbH);
-
-  // Inner glow
-  ctx.strokeStyle = 'rgba(50,60,100,0.4)';
+  ctx.strokeStyle = 'rgba(40,50,90,0.4)';
   ctx.lineWidth = 1;
   ctx.strokeRect(sbX + 3, sbY + 3, sbW - 6, sbH - 6);
 
-  // LED pixel effect overlay
-  ctx.globalAlpha = 0.03;
-  ctx.fillStyle = '#fff';
+  // Subtle LED pixel effect
+  ctx.globalAlpha = 0.015;
+  ctx.fillStyle = '#88aaff';
   for (let py = sbY + 5; py < sbY + sbH - 5; py += 3) {
     for (let px = sbX + 5; px < sbX + sbW - 5; px += 3) {
       ctx.fillRect(px, py, 1, 1);
@@ -411,368 +592,557 @@ function drawScoreboard() {
   }
   ctx.globalAlpha = 1;
 
-  // LED text
   ctx.textAlign = 'center';
 
   // Title
   ctx.font = 'bold 11px monospace';
   ctx.fillStyle = '#ffaa00';
+  ctx.shadowColor = 'rgba(255,170,0,0.3)';
+  ctx.shadowBlur = 4;
   ctx.fillText('HOME RUN DERBY', sbX + sbW / 2, sbY + 18);
+  ctx.shadowBlur = 0;
 
-  // Divider line
-  ctx.strokeStyle = '#333355';
+  // Divider
+  ctx.strokeStyle = '#222244';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(sbX + 10, sbY + 24);
   ctx.lineTo(sbX + sbW - 10, sbY + 24);
   ctx.stroke();
 
-  // HR Count - big LED numbers
-  ctx.font = 'bold 28px monospace';
+  // HR Count
+  ctx.font = 'bold 30px monospace';
   ctx.fillStyle = '#ff3333';
-  // LED glow
   ctx.shadowColor = 'rgba(255,50,50,0.5)';
-  ctx.shadowBlur = 8;
-  ctx.fillText(String(totalHR + homeRuns).padStart(2, '0'), sbX + sbW / 2, sbY + 55);
+  ctx.shadowBlur = 10;
+  ctx.fillText(String(totalHR + homeRuns).padStart(2, '0'), sbX + sbW / 2, sbY + 57);
   ctx.shadowBlur = 0;
 
   ctx.font = 'bold 10px monospace';
-  ctx.fillStyle = '#888899';
-  ctx.fillText('HOME RUNS', sbX + sbW / 2, sbY + 68);
+  ctx.fillStyle = '#667788';
+  ctx.fillText('HOME RUNS', sbX + sbW / 2, sbY + 70);
 
-  // Round indicator
-  ctx.fillStyle = '#44cc44';
+  ctx.fillStyle = '#33cc44';
+  ctx.shadowColor = 'rgba(50,200,70,0.3)';
+  ctx.shadowBlur = 3;
   ctx.font = 'bold 11px monospace';
-  ctx.fillText('RD ' + round + '  PITCH ' + (10 - pitchesLeft + 1) + '/10', sbX + sbW / 2, sbY + 83);
+  ctx.fillText('RD ' + round + '  PITCH ' + (10 - pitchesLeft + 1) + '/10', sbX + sbW / 2, sbY + 86);
+  ctx.shadowBlur = 0;
 }
+
+// ==============================================================
+// OUTFIELD WALL
+// ==============================================================
 
 function drawOutfieldWall() {
   // Warning track
-  ctx.fillStyle = '#7A5A14';
+  const wtG = ctx.createLinearGradient(0, 448, 0, 466);
+  wtG.addColorStop(0, '#7A5A18');
+  wtG.addColorStop(0.3, '#8B6820');
+  wtG.addColorStop(0.6, '#7A5A18');
+  wtG.addColorStop(1, '#6A4E14');
+  ctx.fillStyle = wtG;
   ctx.beginPath();
-  ctx.moveTo(50, 448);
-  ctx.lineTo(1870, 448);
-  ctx.lineTo(1850, 462);
-  ctx.lineTo(70, 462);
+  ctx.moveTo(40, 450);
+  ctx.lineTo(1880, 450);
+  ctx.lineTo(1860, 466);
+  ctx.lineTo(60, 466);
   ctx.closePath();
   ctx.fill();
 
   // Outfield wall - dark green padded
-  const wallG = ctx.createLinearGradient(0, 438, 0, 462);
-  wallG.addColorStop(0, '#0a3a12');
-  wallG.addColorStop(0.3, '#0e4a18');
-  wallG.addColorStop(0.5, '#0c4215');
-  wallG.addColorStop(0.7, '#0a3a12');
-  wallG.addColorStop(1, '#08300e');
+  const wallG = ctx.createLinearGradient(0, 436, 0, 466);
+  wallG.addColorStop(0, '#073010');
+  wallG.addColorStop(0.15, '#0a4016');
+  wallG.addColorStop(0.35, '#0c481a');
+  wallG.addColorStop(0.5, '#0a4016');
+  wallG.addColorStop(0.7, '#083812');
+  wallG.addColorStop(0.85, '#06300e');
+  wallG.addColorStop(1, '#052a0c');
   ctx.fillStyle = wallG;
   ctx.beginPath();
-  ctx.moveTo(50, 438);
-  ctx.lineTo(1870, 438);
-  ctx.lineTo(1870, 462);
-  ctx.lineTo(50, 462);
+  ctx.moveTo(40, 436);
+  ctx.lineTo(1880, 436);
+  ctx.lineTo(1880, 466);
+  ctx.lineTo(40, 466);
   ctx.closePath();
   ctx.fill();
 
-  // Padding vertical lines
-  ctx.strokeStyle = 'rgba(5,25,8,0.6)';
+  // Quilted/padded vertical lines
+  ctx.strokeStyle = 'rgba(3,18,6,0.6)';
   ctx.lineWidth = 1;
-  for (let x = 70; x < 1860; x += 18) {
+  for (let x = 60; x < 1870; x += 16) {
     ctx.beginPath();
-    ctx.moveTo(x, 439);
-    ctx.lineTo(x, 461);
+    ctx.moveTo(x, 437);
+    ctx.lineTo(x, 465);
     ctx.stroke();
   }
-
-  // Yellow line on top of wall
-  ctx.strokeStyle = '#ddcc00';
-  ctx.lineWidth = 3;
+  // Horizontal padding line mid-wall
+  ctx.strokeStyle = 'rgba(3,18,6,0.3)';
   ctx.beginPath();
-  ctx.moveTo(50, 438);
-  ctx.lineTo(1870, 438);
+  ctx.moveTo(40, 451);
+  ctx.lineTo(1880, 451);
   ctx.stroke();
 
-  // Distance markers - hand-painted style
-  ctx.font = 'bold 13px Arial';
+  // Yellow HR line on top with glow
+  ctx.strokeStyle = '#ddcc00';
+  ctx.lineWidth = 3.5;
+  ctx.shadowColor = 'rgba(220,200,0,0.3)';
+  ctx.shadowBlur = 5;
+  ctx.beginPath();
+  ctx.moveTo(40, 436);
+  ctx.lineTo(1880, 436);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Distance markers - painted on wall
+  ctx.font = 'bold 12px Arial';
   ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#e0e0d0';
   const distances = [
-    [250, '330'], [500, '370'], [750, '390'], [960, '400'],
-    [1170, '390'], [1420, '370'], [1670, '330']
+    [230, '330'], [480, '370'], [720, '390'], [960, '400'],
+    [1200, '390'], [1440, '370'], [1690, '330']
   ];
   distances.forEach(([x, d]) => {
+    // Slight shadow behind text
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillText(d, x + 1, 457);
+    ctx.fillStyle = '#e0e0d0';
     ctx.fillText(d, x, 456);
   });
 
-  // Foul poles - yellow
+  // Foul poles - bright yellow
   ctx.strokeStyle = '#eedd00';
-  ctx.lineWidth = 4;
-  ctx.beginPath(); ctx.moveTo(52, 340); ctx.lineTo(52, 465); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(1868, 340); ctx.lineTo(1868, 465); ctx.stroke();
-  // Pole netting
+  ctx.lineWidth = 5;
+  ctx.shadowColor = 'rgba(230,220,0,0.2)';
+  ctx.shadowBlur = 4;
+  ctx.beginPath(); ctx.moveTo(44, 330); ctx.lineTo(44, 468); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(1876, 330); ctx.lineTo(1876, 468); ctx.stroke();
+  ctx.shadowBlur = 0;
+  // Pole tops
   ctx.fillStyle = '#eedd00';
-  ctx.fillRect(48, 335, 8, 8);
-  ctx.fillRect(1864, 335, 8, 8);
+  ctx.fillRect(40, 326, 8, 8);
+  ctx.fillRect(1872, 326, 8, 8);
+
+  // Bullpen hints behind wall in gaps
+  ctx.fillStyle = 'rgba(20,40,20,0.3)';
+  ctx.fillRect(160, 432, 80, 6);
+  ctx.fillRect(1680, 432, 80, 6);
 }
 
+// ==============================================================
+// FIELD
+// ==============================================================
+
 function drawField() {
-  // ---- Outfield grass ----
-  const grassG = ctx.createLinearGradient(0, 462, 0, H);
-  grassG.addColorStop(0, '#1a6a22');
-  grassG.addColorStop(0.15, '#1e7228');
-  grassG.addColorStop(0.5, '#1a6a22');
-  grassG.addColorStop(1, '#146018');
+  // ---- Outfield grass with mow pattern ----
+  const grassG = ctx.createLinearGradient(0, 466, 0, H);
+  grassG.addColorStop(0, '#146818');
+  grassG.addColorStop(0.08, '#187020');
+  grassG.addColorStop(0.2, '#1a7424');
+  grassG.addColorStop(0.5, '#167020');
+  grassG.addColorStop(0.8, '#126418');
+  grassG.addColorStop(1, '#0e5a14');
   ctx.fillStyle = grassG;
   ctx.beginPath();
-  ctx.moveTo(50, 462);
-  ctx.lineTo(1870, 462);
+  ctx.moveTo(40, 466);
+  ctx.lineTo(1880, 466);
   ctx.lineTo(W + 200, H + 100);
   ctx.lineTo(-200, H + 100);
   ctx.closePath();
   ctx.fill();
 
-  // Mowing stripes - diamond/checkerboard pattern
+  // Mowing stripes - radiating diamond/crosshatch from home plate
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(50, 462);
-  ctx.lineTo(1870, 462);
+  ctx.moveTo(40, 466);
+  ctx.lineTo(1880, 466);
   ctx.lineTo(W + 200, H + 100);
   ctx.lineTo(-200, H + 100);
   ctx.closePath();
   ctx.clip();
 
-  // Radiating mow lines from home plate (like real MLB)
-  for (let i = 0; i < 20; i++) {
+  // Diamond crosshatch mow pattern (Busch Stadium style)
+  const cx = 960, cy = H + 60;
+  // First set of radiating stripes
+  for (let i = 0; i < 24; i++) {
     if (i % 2 === 0) continue;
-    ctx.globalAlpha = 0.05;
-    ctx.fillStyle = '#88ff88';
+    ctx.globalAlpha = 0.04;
+    ctx.fillStyle = '#60cc60';
     ctx.beginPath();
-    const angle1 = -0.9 + (i / 20) * 1.8;
-    const angle2 = -0.9 + ((i + 1) / 20) * 1.8;
-    const cx = 960, cy = H + 40;
+    const angle1 = -1.0 + (i / 24) * 2.0;
+    const angle2 = -1.0 + ((i + 1) / 24) * 2.0;
     ctx.moveTo(cx, cy);
-    ctx.lineTo(cx + Math.sin(angle1) * 1200, cy - Math.cos(angle1) * 1200);
-    ctx.lineTo(cx + Math.sin(angle2) * 1200, cy - Math.cos(angle2) * 1200);
+    ctx.lineTo(cx + Math.sin(angle1) * 1400, cy - Math.cos(angle1) * 1400);
+    ctx.lineTo(cx + Math.sin(angle2) * 1400, cy - Math.cos(angle2) * 1400);
     ctx.closePath();
     ctx.fill();
   }
+  // Cross-pattern (perpendicular stripes for diamond effect)
+  for (let i = 0; i < 20; i++) {
+    if (i % 2 === 0) continue;
+    ctx.globalAlpha = 0.02;
+    ctx.fillStyle = '#50bb50';
+    const y1 = 466 + i * 32;
+    ctx.fillRect(-200, y1, W + 400, 16);
+  }
   ctx.globalAlpha = 1;
 
-  // Light sheen from stadium lights
-  const sheenG = ctx.createRadialGradient(960, 500, 50, 960, 600, 700);
-  sheenG.addColorStop(0, 'rgba(255,255,220,0.04)');
-  sheenG.addColorStop(1, 'rgba(255,255,220,0)');
+  // Grass texture overlay
+  const grassPat = ctx.createPattern(grassNoiseCanvas, 'repeat');
+  ctx.fillStyle = grassPat;
+  ctx.globalAlpha = 0.5;
+  ctx.fillRect(-200, 466, W + 400, H);
+  ctx.globalAlpha = 1;
+
+  // Stadium light sheen on grass
+  const sheenG = ctx.createRadialGradient(960, 520, 30, 960, 600, 800);
+  sheenG.addColorStop(0, 'rgba(255,255,210,0.05)');
+  sheenG.addColorStop(0.5, 'rgba(255,255,200,0.02)');
+  sheenG.addColorStop(1, 'rgba(255,255,200,0)');
   ctx.fillStyle = sheenG;
-  ctx.fillRect(0, 460, W, H);
+  ctx.fillRect(0, 466, W, H);
+
+  // Hot spot highlights where lights hit the field
+  const hotSpots = [[300, 560], [650, 530], [1270, 530], [1620, 560]];
+  hotSpots.forEach(([hx, hy]) => {
+    const hs = ctx.createRadialGradient(hx, hy, 10, hx, hy, 200);
+    hs.addColorStop(0, 'rgba(255,255,220,0.025)');
+    hs.addColorStop(1, 'rgba(255,255,220,0)');
+    ctx.fillStyle = hs;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 200, 0, Math.PI * 2);
+    ctx.fill();
+  });
 
   ctx.restore();
 
   // ---- Dirt infield ----
-  const dirtG = ctx.createRadialGradient(960, 700, 20, 960, 700, 300);
-  dirtG.addColorStop(0, '#9B7335');
-  dirtG.addColorStop(0.5, '#8B6830');
-  dirtG.addColorStop(1, '#7A5C28');
+  const dirtG = ctx.createRadialGradient(960, 710, 15, 960, 710, 320);
+  dirtG.addColorStop(0, '#9E7838');
+  dirtG.addColorStop(0.3, '#927030');
+  dirtG.addColorStop(0.6, '#8B6828');
+  dirtG.addColorStop(0.85, '#7A5C22');
+  dirtG.addColorStop(1, '#6A5020');
   ctx.fillStyle = dirtG;
   ctx.beginPath();
   ctx.moveTo(960, 548);
-  ctx.quadraticCurveTo(680, 710, 570, H + 60);
-  ctx.lineTo(1350, H + 60);
-  ctx.quadraticCurveTo(1240, 710, 960, 548);
+  ctx.quadraticCurveTo(670, 720, 560, H + 60);
+  ctx.lineTo(1360, H + 60);
+  ctx.quadraticCurveTo(1250, 720, 960, 548);
   ctx.closePath();
   ctx.fill();
 
-  // Dirt texture - subtle noise
-  ctx.globalAlpha = 0.04;
-  const rng = mulberry32(777);
-  for (let i = 0; i < 300; i++) {
-    const dx = 700 + rng() * 520;
-    const dy = 600 + rng() * 400;
-    ctx.fillStyle = rng() > 0.5 ? '#4a3010' : '#c09040';
-    ctx.fillRect(dx, dy, 2 + rng() * 3, 1 + rng() * 2);
-  }
+  // Dirt texture overlay
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(960, 548);
+  ctx.quadraticCurveTo(670, 720, 560, H + 60);
+  ctx.lineTo(1360, H + 60);
+  ctx.quadraticCurveTo(1250, 720, 960, 548);
+  ctx.closePath();
+  ctx.clip();
+  const dirtPat = ctx.createPattern(dirtNoiseCanvas, 'repeat');
+  ctx.fillStyle = dirtPat;
+  ctx.globalAlpha = 0.6;
+  ctx.fillRect(500, 540, 920, 560);
   ctx.globalAlpha = 1;
+  ctx.restore();
 
-  // Grass cutout in infield (infield grass)
-  ctx.fillStyle = '#1a7024';
+  // Infield grass cutout
+  const ifGrass = ctx.createRadialGradient(960, 690, 20, 960, 690, 150);
+  ifGrass.addColorStop(0, '#1a7826');
+  ifGrass.addColorStop(0.7, '#167020');
+  ifGrass.addColorStop(1, '#146a1e');
+  ctx.fillStyle = ifGrass;
   ctx.beginPath();
   ctx.moveTo(960, 575);
-  ctx.lineTo(1160, 700);
-  ctx.quadraticCurveTo(960, 820, 760, 700);
+  ctx.lineTo(1170, 705);
+  ctx.quadraticCurveTo(960, 830, 750, 705);
   ctx.closePath();
   ctx.fill();
 
-  // Infield mow pattern
-  ctx.globalAlpha = 0.04;
-  ctx.fillStyle = '#88ff88';
+  // Infield mow pattern (diamond)
+  ctx.globalAlpha = 0.035;
+  ctx.fillStyle = '#60cc60';
   ctx.beginPath();
-  ctx.moveTo(960, 575);
-  ctx.lineTo(1060, 650);
-  ctx.lineTo(960, 750);
-  ctx.lineTo(860, 650);
+  ctx.moveTo(960, 595);
+  ctx.lineTo(1080, 670);
+  ctx.lineTo(960, 760);
+  ctx.lineTo(840, 670);
   ctx.closePath();
   ctx.fill();
   ctx.globalAlpha = 1;
 
   // ---- Base paths - chalk lines ----
-  ctx.strokeStyle = 'rgba(220,210,190,0.5)';
+  ctx.strokeStyle = 'rgba(220,215,200,0.5)';
   ctx.lineWidth = 2.5;
-  // 1st base line
-  ctx.beginPath(); ctx.moveTo(960, H + 20); ctx.lineTo(1300, 640); ctx.stroke();
-  // 3rd base line
-  ctx.beginPath(); ctx.moveTo(960, H + 20); ctx.lineTo(620, 640); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(960, H + 20); ctx.lineTo(1310, 645); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(960, H + 20); ctx.lineTo(610, 645); ctx.stroke();
 
-  // ---- Bases ----
-  ctx.fillStyle = '#f0e8d8';
+  // ---- Bases with shadows ----
   // 1st base
-  ctx.save(); ctx.translate(1175, 715); ctx.rotate(Math.PI / 4);
-  ctx.fillRect(-9, -9, 18, 18); ctx.restore();
-  ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1;
-  ctx.save(); ctx.translate(1175, 715); ctx.rotate(Math.PI / 4);
-  ctx.strokeRect(-9, -9, 18, 18); ctx.restore();
+  ctx.save();
+  ctx.translate(1180, 720);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(-8, -6, 18, 18);
+  ctx.fillStyle = '#f0e8d8';
+  ctx.fillRect(-9, -9, 18, 18);
+  ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(-9, -9, 18, 18);
+  ctx.restore();
 
   // 2nd base
+  ctx.save();
+  ctx.translate(960, 568);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(-6, -4, 16, 16);
   ctx.fillStyle = '#f0e8d8';
-  ctx.save(); ctx.translate(960, 568); ctx.rotate(Math.PI / 4);
-  ctx.fillRect(-8, -8, 16, 16); ctx.restore();
+  ctx.fillRect(-8, -8, 16, 16);
+  ctx.restore();
 
   // 3rd base
-  ctx.save(); ctx.translate(745, 715); ctx.rotate(Math.PI / 4);
-  ctx.fillRect(-9, -9, 18, 18); ctx.restore();
+  ctx.save();
+  ctx.translate(740, 720);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(-8, -6, 18, 18);
+  ctx.fillStyle = '#f0e8d8';
+  ctx.fillRect(-9, -9, 18, 18);
+  ctx.restore();
 
   // ---- Pitcher's mound ----
-  // Elevated mound
-  const moundG = ctx.createRadialGradient(960, 655, 5, 960, 660, 45);
-  moundG.addColorStop(0, '#a88838');
-  moundG.addColorStop(0.7, '#9B7730');
-  moundG.addColorStop(1, '#7a6028');
+  // Elevated dirt mound
+  const moundG = ctx.createRadialGradient(960, 658, 4, 960, 662, 48);
+  moundG.addColorStop(0, '#aa8a3a');
+  moundG.addColorStop(0.4, '#9E7E32');
+  moundG.addColorStop(0.7, '#8B7028');
+  moundG.addColorStop(1, '#7a6022');
   ctx.fillStyle = moundG;
   ctx.beginPath();
-  ctx.ellipse(960, 660, 42, 18, 0, 0, Math.PI * 2);
+  ctx.ellipse(960, 662, 44, 20, 0, 0, Math.PI * 2);
   ctx.fill();
-  // Rubber
+  // Landing area - worn darker
+  ctx.fillStyle = 'rgba(60,45,15,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(960, 670, 20, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Rubber (white)
   ctx.fillStyle = '#e8e0d0';
+  ctx.shadowColor = 'rgba(0,0,0,0.2)';
+  ctx.shadowBlur = 2;
   ctx.fillRect(952, 654, 16, 4);
+  ctx.shadowBlur = 0;
 
   // ---- Home plate area ----
   // Dirt circle
-  const hpDirtG = ctx.createRadialGradient(960, H - 30, 10, 960, H - 20, 120);
-  hpDirtG.addColorStop(0, '#9B7730');
-  hpDirtG.addColorStop(1, '#8B6828');
+  const hpDirtG = ctx.createRadialGradient(960, H - 28, 8, 960, H - 20, 130);
+  hpDirtG.addColorStop(0, '#9E7E32');
+  hpDirtG.addColorStop(0.6, '#8B6E28');
+  hpDirtG.addColorStop(1, '#7A6020');
   ctx.fillStyle = hpDirtG;
   ctx.beginPath();
-  ctx.ellipse(960, H - 25, 115, 50, 0, 0, Math.PI * 2);
+  ctx.ellipse(960, H - 25, 120, 55, 0, 0, Math.PI * 2);
   ctx.fill();
 
+  // Dirt texture on home area
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(960, H - 25, 120, 55, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = dirtPat;
+  ctx.globalAlpha = 0.4;
+  ctx.fillRect(830, H - 85, 260, 120);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
   // Home plate
-  ctx.fillStyle = '#e8e0d0';
+  ctx.fillStyle = '#e8e2d4';
+  ctx.shadowColor = 'rgba(0,0,0,0.25)';
+  ctx.shadowBlur = 3;
   ctx.beginPath();
   ctx.moveTo(960, H - 8);
-  ctx.lineTo(974, H - 22);
-  ctx.lineTo(974, H - 40);
-  ctx.lineTo(946, H - 40);
-  ctx.lineTo(946, H - 22);
+  ctx.lineTo(975, H - 22);
+  ctx.lineTo(975, H - 42);
+  ctx.lineTo(945, H - 42);
+  ctx.lineTo(945, H - 22);
   ctx.closePath();
   ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(0,0,0,0.15)';
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  // Batter's box chalk lines
-  ctx.strokeStyle = 'rgba(230,225,215,0.6)';
+  // Batter's box chalk lines (scuffed)
+  ctx.strokeStyle = 'rgba(230,225,215,0.5)';
   ctx.lineWidth = 2;
-  ctx.strokeRect(900, H - 60, 38, 58);
-  ctx.strokeRect(982, H - 60, 38, 58);
+  // Left box
+  ctx.setLineDash([8, 3]);
+  ctx.strokeRect(896, H - 62, 40, 60);
+  // Right box
+  ctx.strokeRect(984, H - 62, 40, 60);
+  ctx.setLineDash([]);
 
-  // ---- Catcher (subtle dark figure behind home) ----
-  ctx.fillStyle = 'rgba(30,30,40,0.5)';
-  // Catcher body (crouching)
+  // On-deck circle (left side)
+  ctx.strokeStyle = 'rgba(220,215,200,0.2)';
+  ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.ellipse(960, H + 5, 25, 18, 0, Math.PI, Math.PI * 2);
-  ctx.fill();
-  // Catcher head
-  ctx.beginPath();
-  ctx.arc(960, H - 8, 9, 0, Math.PI * 2);
-  ctx.fill();
-  // Catcher mitt (left side)
-  ctx.fillStyle = 'rgba(70,50,20,0.4)';
-  ctx.beginPath();
-  ctx.ellipse(942, H - 2, 10, 8, -0.3, 0, Math.PI * 2);
-  ctx.fill();
+  ctx.arc(780, H - 10, 25, 0, Math.PI * 2);
+  ctx.stroke();
 
-  // ---- Umpire (subtle dark figure behind catcher) ----
-  ctx.fillStyle = 'rgba(15,15,25,0.35)';
-  // Umpire body
+  // ---- Catcher ----
+  ctx.save();
+  // Catcher body (crouching behind plate)
+  // Chest protector
+  ctx.fillStyle = '#1a1a28';
   ctx.beginPath();
-  ctx.ellipse(960, H + 25, 20, 22, 0, Math.PI, Math.PI * 2);
+  ctx.ellipse(960, H + 4, 28, 20, 0, Math.PI, Math.PI * 2);
   ctx.fill();
-  // Umpire head
+  // Body detail
+  ctx.fillStyle = '#22222e';
+  ctx.fillRect(940, H - 12, 40, 18);
+  // Shin guards
+  ctx.fillStyle = '#282838';
+  ctx.fillRect(938, H + 2, 12, 16);
+  ctx.fillRect(970, H + 2, 12, 16);
+  // Head/helmet
+  const catcherHelmG = ctx.createRadialGradient(960, H - 12, 2, 960, H - 10, 12);
+  catcherHelmG.addColorStop(0, '#333340');
+  catcherHelmG.addColorStop(1, '#1a1a28');
+  ctx.fillStyle = catcherHelmG;
   ctx.beginPath();
-  ctx.arc(960, H + 2, 8, 0, Math.PI * 2);
+  ctx.arc(960, H - 10, 11, 0, Math.PI * 2);
   ctx.fill();
+  // Facemask bars
+  ctx.strokeStyle = 'rgba(100,100,120,0.3)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(955, H - 5); ctx.lineTo(955, H + 2);
+  ctx.moveTo(960, H - 5); ctx.lineTo(960, H + 2);
+  ctx.moveTo(965, H - 5); ctx.lineTo(965, H + 2);
+  ctx.stroke();
+  // Mitt (target)
+  ctx.fillStyle = '#5a3a16';
+  ctx.beginPath();
+  ctx.ellipse(942, H - 2, 12, 10, -0.25, 0, Math.PI * 2);
+  ctx.fill();
+  // Mitt pocket
+  ctx.fillStyle = '#4a2a0e';
+  ctx.beginPath();
+  ctx.ellipse(941, H - 1, 7, 6, -0.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // ---- Umpire ----
+  ctx.fillStyle = '#0e0e18';
+  ctx.beginPath();
+  ctx.ellipse(960, H + 28, 22, 24, 0, Math.PI, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#121220';
+  ctx.beginPath();
+  ctx.arc(960, H + 2, 9, 0, Math.PI * 2);
+  ctx.fill();
+  // Ump indicator
+  ctx.fillStyle = '#1a1a2a';
+  ctx.fillRect(950, H + 3, 20, 6);
 }
+
+// ==============================================================
+// STADIUM LIGHTS
+// ==============================================================
 
 function drawStadiumLights() {
   const poles = [
-    [70, 185], [280, 175], [500, 195],
-    [1420, 195], [1640, 175], [1850, 185]
+    [60, 182], [270, 172], [490, 192],
+    [1430, 192], [1650, 172], [1860, 182]
   ];
   poles.forEach(([px, py]) => {
-    // Pole
-    ctx.strokeStyle = '#3a3a4a';
-    ctx.lineWidth = 4;
+    // Pole (steel grey)
+    const poleG = ctx.createLinearGradient(px - 3, py, px + 3, py);
+    poleG.addColorStop(0, '#2a2a3a');
+    poleG.addColorStop(0.5, '#3a3a4e');
+    poleG.addColorStop(1, '#2a2a3a');
+    ctx.strokeStyle = poleG;
+    ctx.lineWidth = 5;
     ctx.beginPath();
     ctx.moveTo(px, py);
-    ctx.lineTo(px, 440);
+    ctx.lineTo(px, 442);
     ctx.stroke();
 
     // Light bank housing
-    ctx.fillStyle = '#2a2a38';
-    ctx.fillRect(px - 18, py - 12, 36, 16);
+    ctx.fillStyle = '#222230';
+    ctx.fillRect(px - 20, py - 14, 40, 18);
+    // Housing shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(px - 20, py + 2, 40, 4);
 
-    // Light bank - bright
-    ctx.fillStyle = '#fffff0';
-    ctx.shadowColor = 'rgba(255,255,220,0.7)';
-    ctx.shadowBlur = 25;
-    ctx.fillRect(px - 14, py - 8, 28, 10);
+    // Light bank - very bright with bloom
+    ctx.fillStyle = '#fffff4';
+    ctx.shadowColor = 'rgba(255,255,210,0.8)';
+    ctx.shadowBlur = 35;
+    ctx.fillRect(px - 16, py - 10, 32, 12);
     ctx.shadowBlur = 0;
 
-    // Light halo
-    const halo = ctx.createRadialGradient(px, py, 5, px, py, 80);
-    halo.addColorStop(0, 'rgba(255,255,200,0.12)');
-    halo.addColorStop(0.5, 'rgba(255,255,180,0.04)');
+    // Secondary bloom layer
+    const bloom = ctx.createRadialGradient(px, py - 4, 5, px, py - 4, 60);
+    bloom.addColorStop(0, 'rgba(255,255,220,0.18)');
+    bloom.addColorStop(0.3, 'rgba(255,255,200,0.08)');
+    bloom.addColorStop(0.6, 'rgba(255,255,180,0.02)');
+    bloom.addColorStop(1, 'rgba(255,255,180,0)');
+    ctx.fillStyle = bloom;
+    ctx.beginPath();
+    ctx.arc(px, py - 4, 60, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Light halo (larger, softer)
+    const halo = ctx.createRadialGradient(px, py, 3, px, py, 110);
+    halo.addColorStop(0, 'rgba(255,255,200,0.08)');
+    halo.addColorStop(0.4, 'rgba(255,255,180,0.03)');
     halo.addColorStop(1, 'rgba(255,255,180,0)');
     ctx.fillStyle = halo;
     ctx.beginPath();
-    ctx.arc(px, py, 80, 0, Math.PI * 2);
+    ctx.arc(px, py, 110, 0, Math.PI * 2);
     ctx.fill();
 
-    // Light beams onto field
-    ctx.fillStyle = 'rgba(255,255,210,0.012)';
+    // Light beams onto field (volumetric)
+    ctx.fillStyle = 'rgba(255,255,210,0.008)';
     ctx.beginPath();
-    ctx.moveTo(px - 14, py + 8);
-    ctx.lineTo(px - 250, 500);
-    ctx.lineTo(px + 250, 500);
-    ctx.lineTo(px + 14, py + 8);
+    ctx.moveTo(px - 16, py + 8);
+    ctx.lineTo(px - 300, 520);
+    ctx.lineTo(px + 300, 520);
+    ctx.lineTo(px + 16, py + 8);
+    ctx.closePath();
+    ctx.fill();
+    // Second beam pass for volume
+    ctx.fillStyle = 'rgba(255,255,200,0.005)';
+    ctx.beginPath();
+    ctx.moveTo(px - 10, py + 8);
+    ctx.lineTo(px - 180, 500);
+    ctx.lineTo(px + 180, 500);
+    ctx.lineTo(px + 10, py + 8);
     ctx.closePath();
     ctx.fill();
   });
 }
 
+// ==============================================================
+// PITCHER
+// ==============================================================
+
 function drawPitcher() {
   const px = 960, py = 645;
   ctx.save();
 
-  let bodyTilt = 0;
-  let armAngle = 0;
-  let legSpread = 0;
-
+  let bodyTilt = 0, armAngle = 0, legSpread = 0;
   if (windupPhase === 1) {
-    // Wind-up animation
     const wp = Math.min(1, windupTimer / 40);
     bodyTilt = Math.sin(wp * Math.PI) * 0.15;
     armAngle = wp * Math.PI * 0.8;
     legSpread = Math.sin(wp * Math.PI) * 4;
   } else if (windupPhase === 2) {
-    // Delivery
     const dp = Math.min(1, windupTimer / 15);
     bodyTilt = -dp * 0.2;
     armAngle = Math.PI * 0.8 + dp * Math.PI * 0.7;
@@ -783,115 +1153,138 @@ function drawPitcher() {
   ctx.rotate(bodyTilt);
 
   // Shadow on mound
-  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
   ctx.beginPath();
-  ctx.ellipse(0, 2, 14, 4, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 3, 16, 5, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Legs - white pants
-  ctx.fillStyle = '#e8e0d8';
-  ctx.fillRect(-5 - legSpread, -8, 4, 12);
-  ctx.fillRect(1 + legSpread, -8, 4, 12);
+  // Legs - white pants with subtle shading
+  const legG = ctx.createLinearGradient(-6, -8, 6, 4);
+  legG.addColorStop(0, '#e0d8d0');
+  legG.addColorStop(1, '#c8c0b8');
+  ctx.fillStyle = legG;
+  ctx.fillRect(-5 - legSpread, -8, 4, 13);
+  ctx.fillRect(1 + legSpread, -8, 4, 13);
 
   // Cleats
-  ctx.fillStyle = '#1a1a1a';
-  ctx.fillRect(-6 - legSpread, 3, 5, 3);
-  ctx.fillRect(1 + legSpread, 3, 5, 3);
+  ctx.fillStyle = '#111118';
+  ctx.fillRect(-6 - legSpread, 4, 6, 3);
+  ctx.fillRect(1 + legSpread, 4, 6, 3);
 
-  // Body/jersey - white with red trim
-  ctx.fillStyle = '#e8e0d8';
-  ctx.fillRect(-6, -24, 12, 18);
+  // Body/jersey - Cardinals white with red trim
+  const jerseyG = ctx.createLinearGradient(-7, -25, 7, -8);
+  jerseyG.addColorStop(0, '#e8e0d8');
+  jerseyG.addColorStop(0.5, '#f0e8e0');
+  jerseyG.addColorStop(1, '#d8d0c8');
+  ctx.fillStyle = jerseyG;
+  ctx.fillRect(-7, -25, 14, 19);
 
-  // Red trim on jersey
+  // Red trim
   ctx.fillStyle = '#cc2222';
-  ctx.fillRect(-6, -24, 12, 2);
-  ctx.fillRect(-6, -8, 12, 2);
+  ctx.fillRect(-7, -25, 14, 2);
+  ctx.fillRect(-7, -8, 14, 2);
 
-  // Jersey number (subtle)
+  // Jersey number
   ctx.fillStyle = '#cc2222';
-  ctx.font = 'bold 6px Arial';
+  ctx.font = 'bold 7px Arial';
   ctx.textAlign = 'center';
   ctx.fillText('45', 0, -13);
 
   // Pitching arm
   ctx.save();
-  ctx.translate(5, -20);
+  ctx.translate(6, -21);
   ctx.rotate(-Math.PI * 0.2 + armAngle * 0.3);
-  // Upper arm
-  ctx.fillStyle = '#d4a574';
-  ctx.fillRect(-2, 0, 4, 10);
-  // Forearm + hand
-  ctx.translate(0, 10);
+  ctx.fillStyle = '#c89a68';
+  ctx.fillRect(-2, 0, 4, 11);
+  ctx.translate(0, 11);
   ctx.rotate(-0.3 + armAngle * 0.4);
-  ctx.fillRect(-2, 0, 4, 9);
-  // Glove or ball hand
+  ctx.fillRect(-2, 0, 4, 10);
   if (windupPhase <= 1) {
-    // Holding ball
     ctx.fillStyle = '#f0e8d8';
     ctx.beginPath();
-    ctx.arc(0, 11, 3, 0, Math.PI * 2);
+    ctx.arc(0, 12, 3, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.restore();
 
-  // Glove arm (left)
+  // Glove arm
   ctx.save();
-  ctx.translate(-5, -20);
+  ctx.translate(-6, -21);
   ctx.rotate(0.3);
-  ctx.fillStyle = '#d4a574';
-  ctx.fillRect(-2, 0, 4, 9);
-  // Glove
-  ctx.fillStyle = '#5a3a1a';
+  ctx.fillStyle = '#c89a68';
+  ctx.fillRect(-2, 0, 4, 10);
+  ctx.fillStyle = '#4a2a10';
   ctx.beginPath();
-  ctx.ellipse(-1, 12, 5, 4, 0, 0, Math.PI * 2);
+  ctx.ellipse(-1, 13, 6, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Glove webbing
+  ctx.fillStyle = '#3a1a08';
+  ctx.beginPath();
+  ctx.ellipse(-1, 12, 3, 3, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
+  // Neck
+  ctx.fillStyle = '#c89a68';
+  ctx.fillRect(-2, -28, 4, 4);
+
   // Head
-  ctx.fillStyle = '#d4a574';
+  ctx.fillStyle = '#c89a68';
   ctx.beginPath();
-  ctx.arc(0, -28, 6, 0, Math.PI * 2);
+  ctx.arc(0, -30, 7, 0, Math.PI * 2);
   ctx.fill();
 
-  // Cap - Cardinals red
-  ctx.fillStyle = '#cc2222';
+  // Cap - Cardinals red with depth
+  const capG = ctx.createLinearGradient(-8, -38, 8, -32);
+  capG.addColorStop(0, '#bb1818');
+  capG.addColorStop(0.5, '#dd2828');
+  capG.addColorStop(1, '#aa1515');
+  ctx.fillStyle = capG;
   ctx.beginPath();
-  ctx.ellipse(0, -33, 8, 3, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, -35, 9, 3.5, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillRect(-7, -35, 14, 4);
+  ctx.fillRect(-8, -37, 16, 5);
   // Bill
-  ctx.fillStyle = '#aa1a1a';
-  ctx.fillRect(-3, -31, 8, 3);
+  ctx.fillStyle = '#991212';
+  ctx.fillRect(-3, -33, 9, 3);
+  // Cap highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.fillRect(-4, -37, 6, 2);
 
   ctx.restore();
 }
+
+// ==============================================================
+// BASEBALL
+// ==============================================================
 
 function drawBall3D(x, y, size, rotation) {
   ctx.save();
   const r = rotation || 0;
 
-  // Ground shadow (only for pitched ball near ground)
-  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  // Ground shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
   ctx.beginPath();
-  ctx.ellipse(x + 2, y + size + 3, size * 0.8, size * 0.25, 0, 0, Math.PI * 2);
+  ctx.ellipse(x + 2, y + size + 4, size * 0.9, size * 0.22, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Ball body
+  // Ball body with realistic shading
   const bg = ctx.createRadialGradient(x - size * 0.3, y - size * 0.3, 0, x, y, size);
   bg.addColorStop(0, '#fffff8');
-  bg.addColorStop(0.5, '#f0ead8');
-  bg.addColorStop(0.8, '#ddd4c0');
-  bg.addColorStop(1, '#b8b0a0');
+  bg.addColorStop(0.3, '#f8f2e4');
+  bg.addColorStop(0.6, '#e8e0cc');
+  bg.addColorStop(0.85, '#ccc4b0');
+  bg.addColorStop(1, '#a8a090');
   ctx.fillStyle = bg;
   ctx.beginPath();
   ctx.arc(x, y, size, 0, Math.PI * 2);
   ctx.fill();
 
-  // Subtle edge shadow
-  ctx.strokeStyle = 'rgba(80,70,50,0.3)';
-  ctx.lineWidth = size * 0.08;
+  // Subtle rim light
+  ctx.strokeStyle = 'rgba(60,55,40,0.25)';
+  ctx.lineWidth = size * 0.06;
   ctx.beginPath();
-  ctx.arc(x, y, size * 0.95, 0, Math.PI * 2);
+  ctx.arc(x, y, size * 0.96, 0, Math.PI * 2);
   ctx.stroke();
 
   // Red stitching with rotation
@@ -900,173 +1293,245 @@ function drawBall3D(x, y, size, rotation) {
     ctx.translate(x, y);
     ctx.rotate(r);
 
-    ctx.strokeStyle = '#cc2222';
-    ctx.lineWidth = Math.max(0.8, size * 0.08);
+    ctx.strokeStyle = '#cc2020';
+    ctx.lineWidth = Math.max(0.8, size * 0.07);
 
     // Left seam
     ctx.beginPath();
-    for (let a = -0.85; a < 0.85; a += 0.1) {
+    for (let a = -0.85; a < 0.85; a += 0.08) {
       const sx = -size * 0.42 + Math.sin(a * 3.5) * size * 0.18;
       const sy = a * size * 0.85;
-      if (a <= -0.85 + 0.1) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      if (a <= -0.85 + 0.08) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
     }
     ctx.stroke();
 
     // Right seam
     ctx.beginPath();
-    for (let a = -0.85; a < 0.85; a += 0.1) {
+    for (let a = -0.85; a < 0.85; a += 0.08) {
       const sx = size * 0.42 - Math.sin(a * 3.5) * size * 0.18;
       const sy = a * size * 0.85;
-      if (a <= -0.85 + 0.1) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      if (a <= -0.85 + 0.08) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
     }
     ctx.stroke();
 
     // Stitch marks
     if (size > 10) {
-      ctx.strokeStyle = '#cc2222';
+      ctx.strokeStyle = '#cc2020';
       ctx.lineWidth = Math.max(0.5, size * 0.04);
-      for (let a = -0.7; a < 0.7; a += 0.25) {
+      for (let a = -0.7; a < 0.7; a += 0.22) {
         const lsx = -size * 0.42 + Math.sin(a * 3.5) * size * 0.18;
         const lsy = a * size * 0.85;
         ctx.beginPath();
-        ctx.moveTo(lsx - size * 0.06, lsy);
-        ctx.lineTo(lsx + size * 0.06, lsy);
+        ctx.moveTo(lsx - size * 0.07, lsy);
+        ctx.lineTo(lsx + size * 0.07, lsy);
         ctx.stroke();
-
         const rsx = size * 0.42 - Math.sin(a * 3.5) * size * 0.18;
         const rsy = a * size * 0.85;
         ctx.beginPath();
-        ctx.moveTo(rsx - size * 0.06, rsy);
-        ctx.lineTo(rsx + size * 0.06, rsy);
+        ctx.moveTo(rsx - size * 0.07, rsy);
+        ctx.lineTo(rsx + size * 0.07, rsy);
         ctx.stroke();
       }
     }
-
     ctx.restore();
   }
 
   // Specular highlight
-  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.fillStyle = 'rgba(255,255,255,0.40)';
   ctx.beginPath();
-  ctx.ellipse(x - size * 0.25, y - size * 0.3, size * 0.2, size * 0.15, -0.5, 0, Math.PI * 2);
+  ctx.ellipse(x - size * 0.25, y - size * 0.3, size * 0.22, size * 0.14, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+  // Secondary highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath();
+  ctx.ellipse(x + size * 0.1, y - size * 0.15, size * 0.08, size * 0.06, 0.3, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.restore();
 }
 
-function drawBatter() {
-  // Over-the-shoulder batter view - close up
-  ctx.save();
+// ==============================================================
+// BATTER (over-the-shoulder, detailed)
+// ==============================================================
 
-  // Batter's body (right-handed hitter from behind)
+function drawBatter() {
+  ctx.save();
   const bx = 870, by = H - 80;
 
   // Batter shadow on ground
-  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillStyle = 'rgba(0,0,0,0.22)';
   ctx.beginPath();
-  ctx.ellipse(bx + 20, by + 45, 50, 12, 0.1, 0, Math.PI * 2);
+  ctx.ellipse(bx + 20, by + 48, 55, 14, 0.1, 0, Math.PI * 2);
   ctx.fill();
 
-  // Back/torso - white jersey
-  ctx.fillStyle = '#e0d8d0';
+  // ---- Pants / Lower body ----
+  ctx.fillStyle = '#d8d0c8';
   ctx.beginPath();
-  ctx.moveTo(bx - 35, by - 60);
-  ctx.quadraticCurveTo(bx - 50, by, bx - 35, by + 30);
-  ctx.lineTo(bx + 35, by + 30);
-  ctx.quadraticCurveTo(bx + 50, by, bx + 35, by - 60);
+  ctx.moveTo(bx - 25, by + 15);
+  ctx.quadraticCurveTo(bx - 30, by + 35, bx - 22, by + 48);
+  ctx.lineTo(bx + 22, by + 48);
+  ctx.quadraticCurveTo(bx + 30, by + 35, bx + 25, by + 15);
   ctx.closePath();
   ctx.fill();
 
-  // Jersey detail - Cardinals home white
-  ctx.fillStyle = '#cc2222';
-  // Collar
+  // Belt
+  ctx.fillStyle = '#1a1a28';
+  ctx.fillRect(bx - 26, by + 12, 52, 6);
+  // Belt buckle
+  ctx.fillStyle = '#888890';
+  ctx.fillRect(bx - 3, by + 13, 6, 4);
+
+  // ---- Back/torso - white jersey with shading ----
+  const jerseyG = ctx.createLinearGradient(bx - 50, by - 60, bx + 50, by + 30);
+  jerseyG.addColorStop(0, '#e8e0d8');
+  jerseyG.addColorStop(0.3, '#f0e8e0');
+  jerseyG.addColorStop(0.6, '#e0d8d0');
+  jerseyG.addColorStop(1, '#ccc4bc');
+  ctx.fillStyle = jerseyG;
   ctx.beginPath();
-  ctx.moveTo(bx - 20, by - 62);
-  ctx.quadraticCurveTo(bx, by - 68, bx + 20, by - 62);
-  ctx.quadraticCurveTo(bx, by - 58, bx - 20, by - 62);
+  ctx.moveTo(bx - 38, by - 60);
+  ctx.quadraticCurveTo(bx - 52, by, bx - 38, by + 30);
+  ctx.lineTo(bx + 38, by + 30);
+  ctx.quadraticCurveTo(bx + 52, by, bx + 38, by - 60);
+  ctx.closePath();
+  ctx.fill();
+
+  // Red piping on sides
+  ctx.strokeStyle = '#cc2222';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(bx - 38, by - 55);
+  ctx.quadraticCurveTo(bx - 50, by, bx - 36, by + 25);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx + 38, by - 55);
+  ctx.quadraticCurveTo(bx + 50, by, bx + 36, by + 25);
+  ctx.stroke();
+
+  // Collar - red v-neck
+  ctx.fillStyle = '#cc2222';
+  ctx.beginPath();
+  ctx.moveTo(bx - 22, by - 62);
+  ctx.quadraticCurveTo(bx, by - 70, bx + 22, by - 62);
+  ctx.quadraticCurveTo(bx, by - 58, bx - 22, by - 62);
   ctx.closePath();
   ctx.fill();
 
   // Number on back
   ctx.fillStyle = '#cc2222';
-  ctx.font = 'bold 32px Arial Black';
+  ctx.font = 'bold 34px Arial Black';
   ctx.textAlign = 'center';
+  // Number shadow
+  ctx.fillStyle = 'rgba(150,20,20,0.3)';
+  ctx.fillText('4', bx + 1, by - 8);
+  ctx.fillStyle = '#cc2222';
   ctx.fillText('4', bx, by - 10);
 
+  // Name on back (above number)
+  ctx.font = 'bold 10px Arial';
+  ctx.fillStyle = '#cc2222';
+  ctx.fillText('MOLINA', bx, by - 38);
+
   // Jersey wrinkle shadows
-  ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+  ctx.strokeStyle = 'rgba(0,0,0,0.05)';
   ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     ctx.beginPath();
-    ctx.moveTo(bx - 20 + i * 12, by - 50);
-    ctx.quadraticCurveTo(bx - 15 + i * 12, by - 20, bx - 20 + i * 12, by + 20);
+    ctx.moveTo(bx - 22 + i * 11, by - 50);
+    ctx.quadraticCurveTo(bx - 18 + i * 11, by - 20, bx - 22 + i * 11, by + 20);
     ctx.stroke();
   }
 
-  // Left shoulder (close to camera - larger)
-  ctx.fillStyle = '#d8d0c8';
+  // Left shoulder (close to camera - larger, with depth)
+  const lsG = ctx.createRadialGradient(bx - 35, by - 55, 5, bx - 35, by - 55, 30);
+  lsG.addColorStop(0, '#e8e0d8');
+  lsG.addColorStop(1, '#c8c0b8');
+  ctx.fillStyle = lsG;
   ctx.beginPath();
-  ctx.ellipse(bx - 35, by - 55, 28, 18, -0.2, 0, Math.PI * 2);
+  ctx.ellipse(bx - 37, by - 55, 30, 20, -0.2, 0, Math.PI * 2);
   ctx.fill();
 
   // Right shoulder
-  ctx.fillStyle = '#d8d0c8';
+  const rsG = ctx.createRadialGradient(bx + 36, by - 55, 4, bx + 36, by - 55, 26);
+  rsG.addColorStop(0, '#e0d8d0');
+  rsG.addColorStop(1, '#c0b8b0');
+  ctx.fillStyle = rsG;
   ctx.beginPath();
-  ctx.ellipse(bx + 35, by - 55, 25, 16, 0.2, 0, Math.PI * 2);
+  ctx.ellipse(bx + 36, by - 55, 27, 18, 0.2, 0, Math.PI * 2);
   ctx.fill();
 
-  // Helmet - left side visible (Cardinals red)
-  const helmG = ctx.createLinearGradient(bx - 40, by - 110, bx + 20, by - 70);
-  helmG.addColorStop(0, '#aa1818');
-  helmG.addColorStop(0.3, '#cc2222');
-  helmG.addColorStop(0.6, '#dd3030');
-  helmG.addColorStop(0.8, '#cc2222');
-  helmG.addColorStop(1, '#991515');
+  // ---- Helmet (Cardinals matte red) ----
+  // Helmet with realistic matte finish gradient
+  const helmG = ctx.createLinearGradient(bx - 42, by - 115, bx + 25, by - 70);
+  helmG.addColorStop(0, '#991515');
+  helmG.addColorStop(0.15, '#aa1818');
+  helmG.addColorStop(0.30, '#c42020');
+  helmG.addColorStop(0.50, '#d42828');
+  helmG.addColorStop(0.70, '#c42020');
+  helmG.addColorStop(0.85, '#b01a1a');
+  helmG.addColorStop(1, '#881212');
   ctx.fillStyle = helmG;
-
-  // Helmet shape
   ctx.beginPath();
-  ctx.moveTo(bx - 28, by - 65);
-  ctx.quadraticCurveTo(bx - 40, by - 95, bx - 15, by - 112);
-  ctx.quadraticCurveTo(bx + 15, by - 118, bx + 30, by - 100);
-  ctx.quadraticCurveTo(bx + 38, by - 82, bx + 25, by - 65);
+  ctx.moveTo(bx - 30, by - 65);
+  ctx.quadraticCurveTo(bx - 42, by - 96, bx - 17, by - 114);
+  ctx.quadraticCurveTo(bx + 14, by - 120, bx + 32, by - 102);
+  ctx.quadraticCurveTo(bx + 40, by - 84, bx + 27, by - 65);
   ctx.closePath();
   ctx.fill();
 
   // Helmet ear flap
-  ctx.fillStyle = '#bb2020';
+  const efG = ctx.createLinearGradient(bx - 35, by - 65, bx - 20, by - 45);
+  efG.addColorStop(0, '#b81c1c');
+  efG.addColorStop(1, '#991515');
+  ctx.fillStyle = efG;
   ctx.beginPath();
-  ctx.moveTo(bx - 28, by - 65);
-  ctx.quadraticCurveTo(bx - 35, by - 55, bx - 30, by - 45);
-  ctx.lineTo(bx - 20, by - 48);
-  ctx.quadraticCurveTo(bx - 22, by - 58, bx - 20, by - 65);
+  ctx.moveTo(bx - 30, by - 65);
+  ctx.quadraticCurveTo(bx - 37, by - 55, bx - 32, by - 44);
+  ctx.lineTo(bx - 21, by - 47);
+  ctx.quadraticCurveTo(bx - 24, by - 58, bx - 22, by - 65);
   ctx.closePath();
   ctx.fill();
 
-  // Helmet shine
-  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  // Helmet matte highlight (subtle, not glossy)
+  ctx.fillStyle = 'rgba(255,200,200,0.08)';
   ctx.beginPath();
-  ctx.ellipse(bx - 5, by - 100, 12, 6, -0.3, 0, Math.PI * 2);
+  ctx.ellipse(bx - 6, by - 102, 14, 7, -0.3, 0, Math.PI * 2);
   ctx.fill();
 
-  // Cardinals bird logo (simplified)
+  // STL logo on helmet
   ctx.fillStyle = '#ffcc00';
-  ctx.font = 'bold 10px Arial';
+  ctx.font = 'bold 11px Arial Black';
   ctx.textAlign = 'center';
-  // Just a subtle "STL" hint
-  ctx.fillText('STL', bx, by - 88);
-
-  // Helmet bill
-  ctx.fillStyle = '#991515';
+  ctx.fillText('STL', bx + 2, by - 88);
+  // Logo bird hint (small red)
+  ctx.fillStyle = '#ff3333';
   ctx.beginPath();
-  ctx.moveTo(bx + 20, by - 80);
-  ctx.quadraticCurveTo(bx + 50, by - 82, bx + 48, by - 72);
-  ctx.lineTo(bx + 22, by - 72);
+  ctx.arc(bx + 2, by - 94, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Helmet bill - casting shadow
+  ctx.fillStyle = '#881010';
+  ctx.beginPath();
+  ctx.moveTo(bx + 22, by - 80);
+  ctx.quadraticCurveTo(bx + 52, by - 83, bx + 50, by - 72);
+  ctx.lineTo(bx + 24, by - 72);
+  ctx.closePath();
+  ctx.fill();
+  // Bill shadow on face area
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath();
+  ctx.moveTo(bx + 20, by - 72);
+  ctx.quadraticCurveTo(bx + 35, by - 68, bx + 30, by - 62);
+  ctx.lineTo(bx + 18, by - 65);
   ctx.closePath();
   ctx.fill();
 
   ctx.restore();
 }
+
+// ==============================================================
+// BAT (detailed Louisville Slugger)
+// ==============================================================
 
 function drawBatDetailed(swingProg) {
   ctx.save();
@@ -1077,135 +1542,194 @@ function drawBatDetailed(swingProg) {
   if (swingProg < 0) {
     angle = -0.55;
   } else {
-    angle = -0.75 + swingProg * 2.2;
+    // Smooth multi-phase swing
+    if (swingProg < 0.3) {
+      // Load back
+      angle = -0.55 - swingProg * 0.5;
+    } else if (swingProg < 0.7) {
+      // Explosive forward swing through zone
+      const t = (swingProg - 0.3) / 0.4;
+      angle = -0.70 + t * 2.2;
+    } else {
+      // Follow through
+      const t = (swingProg - 0.7) / 0.3;
+      angle = 1.5 + t * 0.5;
+    }
   }
   ctx.rotate(angle);
 
   // ---- Hands with batting gloves ----
-  // Back hand (bottom)
-  ctx.fillStyle = '#1a1a1a';
+  // Back hand (bottom) - red/white batting gloves
+  const gloveG = ctx.createRadialGradient(0, -8, 3, 0, -8, 16);
+  gloveG.addColorStop(0, '#cc2020');
+  gloveG.addColorStop(0.6, '#aa1818');
+  gloveG.addColorStop(1, '#881414');
+  ctx.fillStyle = gloveG;
   ctx.beginPath();
-  ctx.ellipse(0, -8, 16, 12, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, -8, 16, 13, 0, 0, Math.PI * 2);
   ctx.fill();
   // Front hand (top)
-  ctx.fillStyle = '#222222';
+  ctx.fillStyle = '#e8e0d8';
   ctx.beginPath();
-  ctx.ellipse(-2, -22, 14, 10, 0.1, 0, Math.PI * 2);
+  ctx.ellipse(-2, -22, 14, 11, 0.1, 0, Math.PI * 2);
   ctx.fill();
-  // Glove wrist detail
-  ctx.fillStyle = '#333';
-  ctx.fillRect(-12, -3, 24, 4);
-  // Finger details
-  ctx.strokeStyle = '#333';
+  // Glove detail - white stripe
+  ctx.fillStyle = '#f0e8e0';
+  ctx.fillRect(-10, -4, 20, 3);
+  // Finger articulation
+  ctx.strokeStyle = 'rgba(100,20,20,0.4)';
   ctx.lineWidth = 1;
   for (let i = 0; i < 4; i++) {
     ctx.beginPath();
-    ctx.moveTo(-8 + i * 5, -14);
-    ctx.lineTo(-8 + i * 5, -6);
+    ctx.moveTo(-8 + i * 5, -15);
+    ctx.lineTo(-8 + i * 5, -4);
     ctx.stroke();
   }
+  // Wrist tape
+  ctx.fillStyle = '#222';
+  ctx.fillRect(-13, 0, 26, 4);
 
-  // ---- Bat knob ----
-  ctx.fillStyle = '#3a2208';
+  // ---- Bat knob (flared) ----
+  ctx.fillStyle = '#2a1608';
   ctx.beginPath();
-  ctx.ellipse(0, 5, 10, 6, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 6, 12, 7, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Knob highlight
+  ctx.fillStyle = 'rgba(200,160,80,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(-3, 4, 5, 3, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // ---- Bat handle (grip/tape) ----
-  ctx.fillStyle = '#1a1008';
-  ctx.fillRect(-5, -35, 10, 40);
-  // Grip tape wrapping
-  ctx.strokeStyle = 'rgba(60,40,10,0.7)';
-  ctx.lineWidth = 2;
-  for (let ty = -32; ty < 0; ty += 5) {
+  // ---- Bat handle (grip tape) ----
+  const handleG = ctx.createLinearGradient(-5, -35, 5, -35);
+  handleG.addColorStop(0, '#1a0e06');
+  handleG.addColorStop(0.3, '#2a1a0e');
+  handleG.addColorStop(0.7, '#2a1a0e');
+  handleG.addColorStop(1, '#1a0e06');
+  ctx.fillStyle = handleG;
+  ctx.fillRect(-5, -36, 10, 42);
+  // Grip tape diagonal wrapping
+  ctx.strokeStyle = 'rgba(50,30,8,0.7)';
+  ctx.lineWidth = 1.5;
+  for (let ty = -34; ty < 2; ty += 4) {
     ctx.beginPath();
     ctx.moveTo(-6, ty);
-    ctx.lineTo(6, ty + 3);
+    ctx.lineTo(6, ty + 2.5);
     ctx.stroke();
   }
 
   // ---- Bat barrel ----
-  const batG = ctx.createLinearGradient(-14, -200, 14, -200);
-  batG.addColorStop(0, '#6a4a0a');
-  batG.addColorStop(0.15, '#8B6914');
-  batG.addColorStop(0.3, '#b8923a');
-  batG.addColorStop(0.45, '#d4aa48');
-  batG.addColorStop(0.55, '#d4aa48');
-  batG.addColorStop(0.7, '#b8923a');
-  batG.addColorStop(0.85, '#8B6914');
-  batG.addColorStop(1, '#6a4a0a');
+  const batG = ctx.createLinearGradient(-16, -200, 16, -200);
+  batG.addColorStop(0, '#5a3a08');
+  batG.addColorStop(0.10, '#7a5810');
+  batG.addColorStop(0.22, '#9a7820');
+  batG.addColorStop(0.35, '#b89230');
+  batG.addColorStop(0.48, '#d4aa44');
+  batG.addColorStop(0.55, '#dab04a');
+  batG.addColorStop(0.65, '#c8a038');
+  batG.addColorStop(0.78, '#a88428');
+  batG.addColorStop(0.88, '#886818');
+  batG.addColorStop(1, '#5a3a08');
   ctx.fillStyle = batG;
 
+  // Barrel shape - proper taper
   ctx.beginPath();
-  ctx.moveTo(-5, -35);
-  ctx.lineTo(-7, -60);
-  ctx.lineTo(-10, -100);
-  ctx.lineTo(-13, -150);
-  ctx.lineTo(-15, -195);
-  ctx.lineTo(-14, -215);
-  ctx.lineTo(14, -215);
-  ctx.lineTo(15, -195);
-  ctx.lineTo(13, -150);
-  ctx.lineTo(10, -100);
-  ctx.lineTo(7, -60);
-  ctx.lineTo(5, -35);
+  ctx.moveTo(-5, -36);
+  ctx.lineTo(-6.5, -55);
+  ctx.lineTo(-9, -90);
+  ctx.lineTo(-12, -130);
+  ctx.lineTo(-14.5, -170);
+  ctx.lineTo(-15.5, -200);
+  ctx.lineTo(-14.5, -218);
+  ctx.quadraticCurveTo(0, -224, 14.5, -218);
+  ctx.lineTo(15.5, -200);
+  ctx.lineTo(14.5, -170);
+  ctx.lineTo(12, -130);
+  ctx.lineTo(9, -90);
+  ctx.lineTo(6.5, -55);
+  ctx.lineTo(5, -36);
   ctx.closePath();
   ctx.fill();
 
-  // Wood grain lines
-  ctx.strokeStyle = 'rgba(80,50,10,0.15)';
-  ctx.lineWidth = 0.7;
-  for (let gx = -10; gx <= 10; gx += 3) {
+  // Wood grain lines - fine detail
+  ctx.strokeStyle = 'rgba(70,45,8,0.12)';
+  ctx.lineWidth = 0.6;
+  for (let gx = -11; gx <= 11; gx += 2.5) {
     ctx.beginPath();
-    ctx.moveTo(gx * 0.5, -40);
-    ctx.quadraticCurveTo(gx * 1.1, -130, gx * 1.3, -210);
+    const wobble = Math.sin(gx * 0.3) * 0.5;
+    ctx.moveTo(gx * 0.45 + wobble, -40);
+    ctx.quadraticCurveTo(gx * 1.05, -130, gx * 1.2 + wobble, -215);
     ctx.stroke();
   }
 
-  // Brand/logo area (like Louisville Slugger)
+  // Brand/logo area
   ctx.save();
-  ctx.translate(0, -150);
-  ctx.rotate(0.05);
-  ctx.fillStyle = 'rgba(50,30,5,0.3)';
-  ctx.font = 'italic 7px Georgia';
+  ctx.translate(0, -152);
+  ctx.rotate(0.04);
+  // Oval logo background
+  ctx.fillStyle = 'rgba(40,25,5,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 12, 20, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(50,30,5,0.35)';
+  ctx.font = 'italic 6px Georgia';
   ctx.textAlign = 'center';
-  ctx.fillText('LOUISVILLE', 0, -5);
-  ctx.fillText('SLUGGER', 0, 3);
+  ctx.fillText('LOUISVILLE', 0, -6);
+  ctx.fillText('SLUGGER', 0, 2);
+  // Small trademark
+  ctx.font = '4px Arial';
+  ctx.fillText('C271', 0, 10);
   ctx.restore();
 
-  // Barrel end cap
-  ctx.fillStyle = '#a07a20';
+  // Barrel end cap (cupped)
+  const capG = ctx.createRadialGradient(0, -218, 2, 0, -218, 14);
+  capG.addColorStop(0, '#8a6a18');
+  capG.addColorStop(0.5, '#a07a20');
+  capG.addColorStop(1, '#7a5a14');
+  ctx.fillStyle = capG;
   ctx.beginPath();
-  ctx.ellipse(0, -215, 14, 5, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, -218, 14.5, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Cup indent
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  ctx.beginPath();
+  ctx.ellipse(0, -219, 8, 3, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Barrel specular highlight
-  ctx.fillStyle = 'rgba(255,255,220,0.1)';
-  ctx.fillRect(2, -200, 4, 140);
+  // Barrel specular highlight (long thin shine)
+  ctx.fillStyle = 'rgba(255,255,220,0.10)';
+  ctx.fillRect(3, -210, 3, 150);
+  // Secondary softer highlight
+  ctx.fillStyle = 'rgba(255,255,220,0.05)';
+  ctx.fillRect(-2, -200, 2, 120);
 
   ctx.restore();
 }
 
+// ==============================================================
+// BALL TRAIL + HIT BALL
+// ==============================================================
+
 function drawBallTrail() {
   for (let i = 0; i < ballTrail.length; i++) {
     const t = ballTrail[i];
-    const alpha = (i / ballTrail.length) * 0.25;
-    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    const alpha = (i / ballTrail.length) * 0.2;
+    ctx.fillStyle = `rgba(255,255,240,${alpha})`;
     ctx.beginPath();
-    ctx.arc(t.x, t.y, t.s * 0.4, 0, Math.PI * 2);
+    ctx.arc(t.x, t.y, t.s * 0.35, 0, Math.PI * 2);
     ctx.fill();
   }
 
   // Speed lines for fast pitches
   if (pitch && pitch.active && pitch.speed > 0.015 && pitch.t > 0.2 && pitch.t < 0.8) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.lineWidth = 1;
-    for (let i = 0; i < 3; i++) {
-      const ox = (Math.random() - 0.5) * pitch.size * 2;
-      const oy = (Math.random() - 0.5) * pitch.size;
+    for (let i = 0; i < 4; i++) {
+      const ox = (Math.random() - 0.5) * pitch.size * 1.8;
+      const oy = (Math.random() - 0.5) * pitch.size * 0.8;
       ctx.beginPath();
       ctx.moveTo(pitch.x + ox, pitch.y + oy);
-      ctx.lineTo(pitch.x + ox, pitch.y + oy - 15 - Math.random() * 20);
+      ctx.lineTo(pitch.x + ox, pitch.y + oy - 18 - Math.random() * 25);
       ctx.stroke();
     }
   }
@@ -1221,18 +1745,18 @@ function drawHitBall() {
   const screenSize = Math.max(1.5, size * perspective);
 
   if (screenY > 0 && screenY < H && screenX > 0 && screenX < W) {
-    // Shadow on ground tracking ball
+    // Shadow on ground
     const shadowY = 460 + (H - 460) * perspective;
-    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
     ctx.beginPath();
     ctx.ellipse(screenX, shadowY, Math.max(2, screenSize * 2.5), Math.max(1, screenSize * 0.4), 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Trail effect behind hit ball
+    // Trail
     if (hitBall.timer < 60) {
-      const trailAlpha = Math.max(0, 0.15 - hitBall.timer * 0.002);
-      ctx.strokeStyle = `rgba(255,255,255,${trailAlpha})`;
-      ctx.lineWidth = screenSize * 0.6;
+      const trailAlpha = Math.max(0, 0.12 - hitBall.timer * 0.002);
+      ctx.strokeStyle = `rgba(255,255,240,${trailAlpha})`;
+      ctx.lineWidth = screenSize * 0.5;
       ctx.beginPath();
       ctx.moveTo(screenX, screenY);
       ctx.lineTo(screenX - hitBall.vx * perspective * 3, screenY + 8);
@@ -1243,43 +1767,38 @@ function drawHitBall() {
   }
 }
 
-// ---- Fireworks ----
+// ==============================================================
+// FIREWORKS / PARTICLES
+// ==============================================================
+
 function spawnFirework(x, y) {
   const baseHue = Math.random() * 360;
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 55; i++) {
     const angle = Math.random() * Math.PI * 2;
-    const speed = 1.5 + Math.random() * 5;
+    const speed = 1.5 + Math.random() * 5.5;
     const hue = baseHue + (Math.random() - 0.5) * 40;
     particles.push({
       x, y,
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed - 2,
       life: 1,
-      decay: 0.008 + Math.random() * 0.015,
-      color: `hsl(${hue}, 100%, ${60 + Math.random() * 30}%)`,
+      decay: 0.007 + Math.random() * 0.014,
+      color: `hsl(${hue}, 100%, ${55 + Math.random() * 35}%)`,
       size: 1.5 + Math.random() * 3,
       trail: true
     });
   }
-  // Center flash
   particles.push({
-    x, y,
-    vx: 0, vy: 0,
-    life: 0.8,
-    decay: 0.06,
-    color: '#fff',
-    size: 15,
-    trail: false
+    x, y, vx: 0, vy: 0, life: 0.8, decay: 0.05,
+    color: '#fff', size: 18, trail: false
   });
 }
 
 function updateParticles() {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
-    p.x += p.vx;
-    p.y += p.vy;
-    p.vy += 0.06;
-    p.vx *= 0.99;
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.06; p.vx *= 0.99;
     p.life -= p.decay;
     if (p.life <= 0) particles.splice(i, 1);
   }
@@ -1292,12 +1811,10 @@ function drawParticles() {
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
     ctx.fill();
-
-    // Glow
     if (p.size > 2) {
-      ctx.globalAlpha = Math.max(0, p.life * 0.3);
+      ctx.globalAlpha = Math.max(0, p.life * 0.25);
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * p.life * 2, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, p.size * p.life * 2.2, 0, Math.PI * 2);
       ctx.fill();
     }
   });
@@ -1306,363 +1823,194 @@ function drawParticles() {
 
 function drawImpactFlash() {
   if (impactFlash > 0) {
-    const flashG = ctx.createRadialGradient(940, H - 60, 0, 940, H - 60, 80 * impactFlash);
-    flashG.addColorStop(0, `rgba(255,255,255,${impactFlash * 0.8})`);
-    flashG.addColorStop(0.5, `rgba(255,240,200,${impactFlash * 0.3})`);
+    // Bright spark at contact
+    const flashG = ctx.createRadialGradient(940, H - 60, 0, 940, H - 60, 90 * impactFlash);
+    flashG.addColorStop(0, `rgba(255,255,255,${impactFlash * 0.9})`);
+    flashG.addColorStop(0.3, `rgba(255,245,210,${impactFlash * 0.4})`);
+    flashG.addColorStop(0.6, `rgba(255,230,170,${impactFlash * 0.15})`);
     flashG.addColorStop(1, 'rgba(255,220,150,0)');
     ctx.fillStyle = flashG;
     ctx.beginPath();
-    ctx.arc(940, H - 60, 80 * impactFlash, 0, Math.PI * 2);
+    ctx.arc(940, H - 60, 90 * impactFlash, 0, Math.PI * 2);
     ctx.fill();
-    impactFlash -= 0.04;
+    impactFlash -= 0.035;
   }
 }
 
-let pitchSpeedDisplay = { text: '', timer: 0 };
+// ==============================================================
+// POST-PROCESSING
+// ==============================================================
 
-// ---- Title Screen ----
-function drawTitle() {
-  ctx.fillStyle = '#050510';
+function applyPostProcessing() {
+  // ---- Vignette (darken edges ~15%) ----
+  const vigG = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * 0.35, W/2, H/2, Math.max(W, H) * 0.75);
+  vigG.addColorStop(0, 'rgba(0,0,0,0)');
+  vigG.addColorStop(0.6, 'rgba(0,0,0,0)');
+  vigG.addColorStop(0.85, 'rgba(0,0,0,0.12)');
+  vigG.addColorStop(1, 'rgba(0,0,0,0.30)');
+  ctx.fillStyle = vigG;
   ctx.fillRect(0, 0, W, H);
 
-  // Night sky
-  const skyG = ctx.createLinearGradient(0, 0, 0, H * 0.5);
-  skyG.addColorStop(0, '#020208');
-  skyG.addColorStop(0.5, '#06101e');
-  skyG.addColorStop(1, '#0c1828');
-  ctx.fillStyle = skyG;
-  ctx.fillRect(0, 0, W, H * 0.5);
-
-  // Stars
-  const rng = mulberry32(88);
-  for (let i = 0; i < 100; i++) {
-    const sx = rng() * W;
-    const sy = rng() * H * 0.35;
-    const twinkle = 0.5 + 0.5 * Math.sin(frameCount * 0.015 + i * 3.1);
-    ctx.globalAlpha = (0.2 + rng() * 0.5) * twinkle;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(sx, sy, 0.5 + rng(), 0, Math.PI * 2);
-    ctx.fill();
-  }
+  // ---- Warm color grading (amber shift) ----
+  ctx.globalAlpha = 0.03;
+  ctx.fillStyle = '#cc8830';
+  ctx.fillRect(0, 0, W, H);
   ctx.globalAlpha = 1;
 
-  // Stadium silhouette - atmospheric
-  ctx.fillStyle = '#0a0a18';
-  ctx.beginPath();
-  ctx.moveTo(0, 580);
-  ctx.lineTo(80, 440); ctx.lineTo(150, 380); ctx.lineTo(300, 340);
-  ctx.lineTo(500, 320); ctx.lineTo(700, 310); ctx.lineTo(960, 305);
-  ctx.lineTo(1220, 310); ctx.lineTo(1420, 320); ctx.lineTo(1620, 340);
-  ctx.lineTo(1770, 380); ctx.lineTo(1840, 440);
-  ctx.lineTo(W, 580); ctx.lineTo(W, H); ctx.lineTo(0, H);
-  ctx.closePath();
-  ctx.fill();
-
-  // Stadium inner glow (field lights)
-  const fieldGlow = ctx.createRadialGradient(960, 500, 50, 960, 500, 500);
-  fieldGlow.addColorStop(0, 'rgba(100,160,80,0.08)');
-  fieldGlow.addColorStop(0.5, 'rgba(80,140,60,0.03)');
-  fieldGlow.addColorStop(1, 'rgba(60,100,40,0)');
-  ctx.fillStyle = fieldGlow;
-  ctx.beginPath();
-  ctx.ellipse(960, 500, 600, 200, 0, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Stadium light banks
-  const lightPositions = [[180, 365], [400, 330], [700, 315], [1220, 315], [1520, 330], [1740, 365]];
-  lightPositions.forEach(([lx, ly]) => {
-    // Light glow halo
-    const lGlow = ctx.createRadialGradient(lx, ly, 2, lx, ly, 60);
-    lGlow.addColorStop(0, 'rgba(255,255,220,0.15)');
-    lGlow.addColorStop(0.5, 'rgba(255,255,200,0.04)');
-    lGlow.addColorStop(1, 'rgba(255,255,200,0)');
-    ctx.fillStyle = lGlow;
-    ctx.beginPath();
-    ctx.arc(lx, ly, 60, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,220,0.7)';
-    ctx.fillRect(lx - 10, ly - 3, 20, 6);
-  });
-
-  // Arch silhouette with subtle metallic hint
+  // ---- Film grain (very subtle, ~3% opacity) ----
+  ctx.globalAlpha = 0.03;
+  ctx.globalCompositeOperation = 'overlay';
+  // Offset grain each frame for organic feel
+  const gx = (frameCount * 37) % 256;
+  const gy = (frameCount * 53) % 256;
+  const grainPat = ctx.createPattern(grainCanvas, 'repeat');
   ctx.save();
-  const archCx = 1150, archBase = 340, archH = 170, archW = 95;
-  // Arch glow
-  const aglow = ctx.createRadialGradient(archCx, archBase - archH * 0.5, 5, archCx, archBase - archH * 0.3, 100);
-  aglow.addColorStop(0, 'rgba(150,160,180,0.04)');
-  aglow.addColorStop(1, 'rgba(150,160,180,0)');
-  ctx.fillStyle = aglow;
-  ctx.beginPath();
-  ctx.arc(archCx, archBase - archH * 0.3, 100, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.beginPath();
-  for (let t = -1; t <= 1; t += 0.015) {
-    const ax = archCx + t * archW;
-    const ay = archBase - archH * (1 - t * t * t * t);
-    if (t === -1) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
-  }
-  const archMG = ctx.createLinearGradient(archCx - archW, 0, archCx + archW, 0);
-  archMG.addColorStop(0, 'rgba(100,110,130,0.3)');
-  archMG.addColorStop(0.3, 'rgba(160,170,190,0.5)');
-  archMG.addColorStop(0.5, 'rgba(180,190,210,0.6)');
-  archMG.addColorStop(0.7, 'rgba(160,170,190,0.5)');
-  archMG.addColorStop(1, 'rgba(100,110,130,0.3)');
-  ctx.strokeStyle = archMG;
-  ctx.lineWidth = 6;
-  ctx.stroke();
+  ctx.translate(gx, gy);
+  ctx.fillStyle = grainPat;
+  ctx.fillRect(-gx, -gy, W + 256, H + 256);
   ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
 
-  // ==== Title text ====
-  const t = Date.now() * 0.001;
-  ctx.save();
-  ctx.textAlign = 'center';
-
-  // "HOMER" - bold athletic with metallic/gold effect
-  ctx.font = 'italic 900 150px "Arial Black", Impact, sans-serif';
-
-  // Deep shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  ctx.fillText('HOMER', 964, 508);
-
-  // Outer glow
-  ctx.shadowColor = 'rgba(200,150,50,0.4)';
-  ctx.shadowBlur = 50;
-  ctx.fillStyle = 'rgba(200,150,50,0.3)';
-  ctx.fillText('HOMER', 960, 504);
-  ctx.shadowBlur = 0;
-
-  // Metallic/gold gradient fill
-  const tg = ctx.createLinearGradient(680, 370, 680, 510);
-  tg.addColorStop(0, '#f0e0b0');
-  tg.addColorStop(0.15, '#fff8e0');
-  tg.addColorStop(0.3, '#e0c060');
-  tg.addColorStop(0.5, '#c8a030');
-  tg.addColorStop(0.65, '#e0c060');
-  tg.addColorStop(0.8, '#fff8e0');
-  tg.addColorStop(1, '#a08020');
-  ctx.fillStyle = tg;
-  ctx.fillText('HOMER', 960, 504);
-
-  // Subtle bright edge on top
-  ctx.strokeStyle = 'rgba(255,250,220,0.4)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeText('HOMER', 960, 504);
-
-  // "HOME RUN DERBY" subtitle
-  ctx.font = '600 30px "Arial", sans-serif';
-  ctx.letterSpacing = '10px';
-  ctx.fillStyle = '#8090a8';
-  ctx.fillText('H O M E   R U N   D E R B Y', 960, 555);
-
-  // Decorative line
-  ctx.strokeStyle = 'rgba(200,180,120,0.3)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(660, 570);
-  ctx.lineTo(1260, 570);
-  ctx.stroke();
-
-  // Baseball seam decorative elements
-  ctx.strokeStyle = 'rgba(200,60,40,0.2)';
-  ctx.lineWidth = 1.5;
-  // Left seam
-  ctx.beginPath();
-  for (let a = 0; a < 1; a += 0.1) {
-    const sx = 640 + a * 40 + Math.sin(a * 8) * 5;
-    const sy = 570;
-    if (a === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-  }
-  ctx.stroke();
-  // Right seam
-  ctx.beginPath();
-  for (let a = 0; a < 1; a += 0.1) {
-    const sx = 1240 + a * 40 + Math.sin(a * 8) * 5;
-    const sy = 570;
-    if (a === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-  }
-  ctx.stroke();
-
-  // Location
-  ctx.font = '600 17px Georgia, serif';
-  ctx.letterSpacing = '6px';
-  ctx.fillStyle = '#556675';
-  ctx.fillText('BUSCH STADIUM  \u2022  ST. LOUIS', 960, 600);
-
-  // Baseball graphic - floating
-  const ballY = 660 + Math.sin(t * 1.5) * 6;
-  drawBall3D(960, ballY, 22, t * 0.5);
-
-  // PLAY button - smooth, premium feel
-  const btnW = 260, btnH = 62;
-  const btnX = 960 - btnW / 2, btnY = 720;
-
-  // Button shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.3)';
-  ctx.beginPath();
-  ctx.roundRect(btnX + 3, btnY + 3, btnW, btnH, 10);
-  ctx.fill();
-
-  // Button glow
-  ctx.shadowColor = 'rgba(200,150,50,0.3)';
-  ctx.shadowBlur = 20;
-  const btnG = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnH);
-  btnG.addColorStop(0, '#c8a030');
-  btnG.addColorStop(0.4, '#a08020');
-  btnG.addColorStop(1, '#806818');
-  ctx.fillStyle = btnG;
-  ctx.beginPath();
-  ctx.roundRect(btnX, btnY, btnW, btnH, 10);
-  ctx.fill();
-  ctx.shadowBlur = 0;
-
-  // Button highlight top edge
-  ctx.strokeStyle = 'rgba(255,240,180,0.4)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(btnX, btnY, btnW, btnH, 10);
-  ctx.stroke();
-
-  ctx.font = 'bold 30px "Arial Black", sans-serif';
-  ctx.letterSpacing = '6px';
-  ctx.fillStyle = '#fff';
-  ctx.fillText('P L A Y', 960, 759);
-
-  // Instructions
-  ctx.font = '15px Arial, sans-serif';
-  ctx.letterSpacing = '0px';
-  ctx.fillStyle = '#445566';
-  ctx.fillText('Tap to swing when the ball is in the strike zone', 960, 830);
-  ctx.fillText('3 rounds  \u2022  10 pitches each  \u2022  Hit as many homers as you can', 960, 855);
-
-  ctx.restore();
+  // ---- Bloom on bright areas (stadium lights) ----
+  // Soft glow overlay on top portion where lights are
+  const bloomG = ctx.createLinearGradient(0, 0, 0, 250);
+  bloomG.addColorStop(0, 'rgba(255,255,220,0.008)');
+  bloomG.addColorStop(0.5, 'rgba(255,255,210,0.004)');
+  bloomG.addColorStop(1, 'rgba(255,255,200,0)');
+  ctx.fillStyle = bloomG;
+  ctx.fillRect(0, 0, W, 250);
 }
 
-// ---- HUD ----
-function drawHUD() {
+// ==============================================================
+// TV BROADCAST SCOREBUG
+// ==============================================================
+
+function drawScorebug() {
   ctx.save();
+  const bx = W - 300, by = H - 58;
 
-  // Modern broadcast style HUD
-
-  // Top-left: Round
-  ctx.textAlign = 'left';
-  const hudBg = 'rgba(0,0,0,0.55)';
-  // Round pill
-  ctx.fillStyle = hudBg;
+  // Background pill
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
   ctx.beginPath();
-  ctx.roundRect(20, 15, 130, 36, 6);
+  ctx.roundRect(bx, by, 280, 42, 6);
   ctx.fill();
-  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.font = 'bold 18px Arial, sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.fillText('ROUND', 32, 38);
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 20px Arial Black';
-  ctx.fillText(round + '/3', 105, 39);
+  // Top border accent
+  ctx.fillStyle = '#cc2222';
+  ctx.fillRect(bx, by, 280, 3);
 
-  // Top-right: Pitches
-  ctx.textAlign = 'right';
-  ctx.fillStyle = hudBg;
-  ctx.beginPath();
-  ctx.roundRect(W - 180, 15, 160, 36, 6);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.font = 'bold 18px Arial, sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.textAlign = 'left';
-  ctx.fillText('PITCHES', W - 170, 38);
-  ctx.fillStyle = '#ffcc00';
-  ctx.font = 'bold 20px Arial Black';
-  ctx.textAlign = 'right';
-  ctx.fillText(pitchesLeft, W - 30, 39);
-
-  // Top-center: Home Runs
+  // Network logo area
+  ctx.fillStyle = 'rgba(40,40,50,0.6)';
+  ctx.fillRect(bx, by + 3, 55, 39);
+  ctx.font = 'bold 12px Arial';
+  ctx.fillStyle = '#888';
   ctx.textAlign = 'center';
-  ctx.fillStyle = hudBg;
-  ctx.beginPath();
-  ctx.roundRect(880, 10, 160, 50, 8);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(255,200,50,0.3)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-  ctx.font = '12px Arial';
+  ctx.fillText('HRD', bx + 28, by + 27);
+
+  // Cardinals logo hint
+  ctx.fillStyle = '#cc2222';
+  ctx.font = 'bold 14px Arial';
+  ctx.textAlign = 'left';
+  ctx.fillText('STL', bx + 65, by + 26);
+
+  // Separator
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(bx + 105, by + 8, 1, 26);
+
+  // HR count
+  ctx.font = 'bold 11px Arial';
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.fillText('HOME RUNS', 960, 28);
-  ctx.font = 'bold 28px Arial Black';
+  ctx.fillText('HR', bx + 115, by + 19);
+  ctx.font = 'bold 22px Arial Black';
   ctx.fillStyle = '#ffcc00';
-  ctx.fillText(homeRuns, 960, 55);
+  ctx.fillText(String(homeRuns), bx + 115, by + 40);
 
-  // Pitch speed display (broadcast style)
+  // Separator
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(bx + 160, by + 8, 1, 26);
+
+  // Round/Pitch info
+  ctx.font = '11px Arial';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillText('RD ' + round, bx + 172, by + 19);
+  ctx.font = 'bold 13px Arial';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('PITCH ' + (10 - pitchesLeft + 1) + '/10', bx + 172, by + 37);
+
+  // Pitch speed (if showing)
   if (pitchSpeedDisplay.timer > 0) {
-    const alpha = Math.min(1, pitchSpeedDisplay.timer / 40);
+    const alpha = Math.min(1, pitchSpeedDisplay.timer / 30);
     ctx.globalAlpha = alpha;
-
-    // Speed box
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
     ctx.beginPath();
-    ctx.roundRect(870, 72, 180, 28, 5);
+    ctx.roundRect(bx - 10, by - 30, 200, 24, 4);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(255,200,100,0.3)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    ctx.font = 'bold 16px Arial';
+    ctx.font = 'bold 14px Arial';
     ctx.fillStyle = '#ffcc66';
-    ctx.textAlign = 'center';
-    ctx.fillText(pitchSpeedDisplay.text, 960, 91);
+    ctx.fillText(pitchSpeedDisplay.text, bx, by - 12);
     ctx.globalAlpha = 1;
     pitchSpeedDisplay.timer--;
   }
 
-  // Last hit distance
+  ctx.restore();
+}
+
+// ==============================================================
+// HUD (in-game overlays)
+// ==============================================================
+
+function drawHUD() {
+  ctx.save();
+
+  // Distance display
   if (lastHitTimer > 0) {
-    const alpha = Math.min(1, lastHitTimer / 30);
+    const alpha = Math.min(1, lastHitTimer / 25);
     const yOff = lastHitTimer > 50 ? (60 - lastHitTimer) * 0.5 : 0;
     ctx.globalAlpha = alpha;
-    ctx.font = 'bold 32px Arial Black';
-    ctx.fillStyle = '#ffdd88';
+    ctx.font = 'bold 34px Arial Black';
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.textAlign = 'center';
+    ctx.fillText(lastHitText, 962, 152 + yOff);
+    ctx.fillStyle = '#ffdd88';
     ctx.fillText(lastHitText, 960, 150 + yOff);
     ctx.globalAlpha = 1;
     lastHitTimer--;
   }
 
-  // HOME RUN text - stadium video board style
+  // HOME RUN text - cinematic
   if (hrTextTimer > 0) {
     const progress = 1 - hrTextTimer / 100;
-    const scale = progress < 0.15 ? progress / 0.15 * 1.2 : progress < 0.25 ? 1.2 - (progress - 0.15) * 2 : 1;
-    const alpha = hrTextTimer > 15 ? 1 : hrTextTimer / 15;
+    const scale = progress < 0.12 ? progress / 0.12 * 1.15 : progress < 0.22 ? 1.15 - (progress - 0.12) * 1.5 : 1;
+    const alpha = hrTextTimer > 12 ? 1 : hrTextTimer / 12;
     ctx.save();
     ctx.translate(960, 320);
     ctx.scale(scale, scale);
     ctx.globalAlpha = alpha;
 
     // LED board background
-    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
     ctx.beginPath();
-    ctx.roundRect(-250, -50, 500, 80, 8);
+    ctx.roundRect(-260, -55, 520, 88, 10);
     ctx.fill();
-
-    // Border glow
-    ctx.strokeStyle = 'rgba(255,200,50,0.6)';
+    ctx.strokeStyle = 'rgba(255,200,50,0.5)';
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Text
-    ctx.font = 'italic bold 65px "Arial Black", sans-serif';
-    const hrG = ctx.createLinearGradient(-200, -30, -200, 30);
+    // Glow behind text
+    ctx.shadowColor = 'rgba(255,200,50,0.4)';
+    ctx.shadowBlur = 20;
+    ctx.font = 'italic bold 68px "Arial Black", sans-serif';
+    const hrG = ctx.createLinearGradient(-200, -30, -200, 25);
     hrG.addColorStop(0, '#fff');
-    hrG.addColorStop(0.3, '#ffee88');
-    hrG.addColorStop(0.6, '#ffcc00');
-    hrG.addColorStop(1, '#ff8800');
+    hrG.addColorStop(0.25, '#ffee88');
+    hrG.addColorStop(0.55, '#ffcc00');
+    hrG.addColorStop(0.8, '#ff9900');
+    hrG.addColorStop(1, '#ff6600');
     ctx.fillStyle = hrG;
     ctx.textAlign = 'center';
     ctx.fillText('HOME RUN!', 0, 18);
+    ctx.shadowBlur = 0;
 
     ctx.globalAlpha = 1;
     ctx.restore();
@@ -1673,9 +2021,11 @@ function drawHUD() {
   if (strikeTimer > 0) {
     const alpha = Math.min(1, strikeTimer / 20);
     ctx.globalAlpha = alpha;
-    ctx.font = 'bold 55px Arial Black';
-    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 58px Arial Black';
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
     ctx.textAlign = 'center';
+    ctx.fillText('STRIKE!', 962, 312);
+    ctx.fillStyle = '#ff3333';
     ctx.fillText('STRIKE!', 960, 310);
     ctx.globalAlpha = 1;
     strikeTimer--;
@@ -1685,9 +2035,11 @@ function drawHUD() {
   if (foulTimer > 0) {
     const alpha = Math.min(1, foulTimer / 20);
     ctx.globalAlpha = alpha;
-    ctx.font = 'bold 45px Arial Black';
-    ctx.fillStyle = '#ffaa44';
+    ctx.font = 'bold 48px Arial Black';
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
     ctx.textAlign = 'center';
+    ctx.fillText('FOUL BALL', 962, 312);
+    ctx.fillStyle = '#ffaa44';
     ctx.fillText('FOUL BALL', 960, 310);
     ctx.globalAlpha = 1;
     foulTimer--;
@@ -1696,22 +2048,257 @@ function drawHUD() {
   ctx.restore();
 }
 
-// ---- Round End Screen ----
+// ==============================================================
+// TITLE SCREEN
+// ==============================================================
+
+function drawTitle() {
+  ctx.fillStyle = '#020308';
+  ctx.fillRect(0, 0, W, H);
+
+  // Night sky gradient
+  const skyG = ctx.createLinearGradient(0, 0, 0, H * 0.55);
+  skyG.addColorStop(0, '#010206');
+  skyG.addColorStop(0.3, '#040a18');
+  skyG.addColorStop(0.6, '#081428');
+  skyG.addColorStop(0.8, '#0c1a30');
+  skyG.addColorStop(1, '#101e34');
+  ctx.fillStyle = skyG;
+  ctx.fillRect(0, 0, W, H * 0.55);
+
+  // Stars
+  const rng = mulberry32(88);
+  for (let i = 0; i < 140; i++) {
+    const sx = rng() * W;
+    const sy = rng() * H * 0.38;
+    const twinkle = 0.5 + 0.5 * Math.sin(frameCount * 0.012 + i * 3.1);
+    ctx.globalAlpha = (0.15 + rng() * 0.45) * twinkle;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 0.3 + rng() * 0.9, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Stadium silhouette
+  const stadG = ctx.createLinearGradient(0, 310, 0, H);
+  stadG.addColorStop(0, '#080810');
+  stadG.addColorStop(1, '#040408');
+  ctx.fillStyle = stadG;
+  ctx.beginPath();
+  ctx.moveTo(0, 580);
+  ctx.lineTo(60, 440); ctx.lineTo(130, 380); ctx.lineTo(280, 345);
+  ctx.lineTo(480, 325); ctx.lineTo(680, 312); ctx.lineTo(960, 308);
+  ctx.lineTo(1240, 312); ctx.lineTo(1440, 325); ctx.lineTo(1640, 345);
+  ctx.lineTo(1790, 380); ctx.lineTo(1860, 440);
+  ctx.lineTo(W, 580); ctx.lineTo(W, H); ctx.lineTo(0, H);
+  ctx.closePath();
+  ctx.fill();
+
+  // Field glow
+  const fieldGlow = ctx.createRadialGradient(960, 510, 40, 960, 510, 550);
+  fieldGlow.addColorStop(0, 'rgba(80,140,60,0.07)');
+  fieldGlow.addColorStop(0.5, 'rgba(60,120,40,0.03)');
+  fieldGlow.addColorStop(1, 'rgba(40,80,30,0)');
+  ctx.fillStyle = fieldGlow;
+  ctx.beginPath();
+  ctx.ellipse(960, 510, 650, 220, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Stadium light banks
+  const lightPositions = [[160, 370], [380, 335], [680, 318], [1240, 318], [1540, 335], [1760, 370]];
+  lightPositions.forEach(([lx, ly]) => {
+    const lGlow = ctx.createRadialGradient(lx, ly, 2, lx, ly, 70);
+    lGlow.addColorStop(0, 'rgba(255,255,220,0.18)');
+    lGlow.addColorStop(0.4, 'rgba(255,255,200,0.05)');
+    lGlow.addColorStop(1, 'rgba(255,255,200,0)');
+    ctx.fillStyle = lGlow;
+    ctx.beginPath();
+    ctx.arc(lx, ly, 70, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,220,0.75)';
+    ctx.fillRect(lx - 12, ly - 3, 24, 7);
+  });
+
+  // Arch silhouette
+  ctx.save();
+  const archCx = 1160, archBase = 345, archH = 175, archW = 98;
+  const aglow = ctx.createRadialGradient(archCx, archBase - archH * 0.5, 5, archCx, archBase - archH * 0.3, 110);
+  aglow.addColorStop(0, 'rgba(140,150,175,0.04)');
+  aglow.addColorStop(1, 'rgba(140,150,175,0)');
+  ctx.fillStyle = aglow;
+  ctx.beginPath();
+  ctx.arc(archCx, archBase - archH * 0.3, 110, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  const cosh = (x) => (Math.exp(x) + Math.exp(-x)) / 2;
+  for (let t = -1; t <= 1; t += 0.01) {
+    const ax = archCx + t * archW;
+    const raw = cosh(t * 1.8) / cosh(1.8);
+    const ay = archBase - archH * (1 - raw);
+    if (t === -1) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
+  }
+  const archMG = ctx.createLinearGradient(archCx - archW, 0, archCx + archW, 0);
+  archMG.addColorStop(0, 'rgba(80,88,105,0.25)');
+  archMG.addColorStop(0.25, 'rgba(130,140,160,0.45)');
+  archMG.addColorStop(0.45, 'rgba(160,170,190,0.55)');
+  archMG.addColorStop(0.55, 'rgba(150,160,180,0.50)');
+  archMG.addColorStop(0.75, 'rgba(120,130,150,0.40)');
+  archMG.addColorStop(1, 'rgba(80,88,105,0.25)');
+  ctx.strokeStyle = archMG;
+  ctx.lineWidth = 7;
+  ctx.stroke();
+  ctx.restore();
+
+  // ==== Title text ====
+  const t = Date.now() * 0.001;
+  ctx.save();
+  ctx.textAlign = 'center';
+
+  // "HOMER" - premium metallic gold
+  ctx.font = 'italic 900 155px "Arial Black", Impact, sans-serif';
+
+  // Deep shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillText('HOMER', 965, 512);
+
+  // Warm glow
+  ctx.shadowColor = 'rgba(200,150,50,0.35)';
+  ctx.shadowBlur = 55;
+  ctx.fillStyle = 'rgba(200,150,50,0.25)';
+  ctx.fillText('HOMER', 960, 508);
+  ctx.shadowBlur = 0;
+
+  // Metallic/gold gradient
+  const tg = ctx.createLinearGradient(680, 370, 680, 515);
+  tg.addColorStop(0, '#e8d8a0');
+  tg.addColorStop(0.12, '#fff8e0');
+  tg.addColorStop(0.25, '#f0d870');
+  tg.addColorStop(0.40, '#d0a828');
+  tg.addColorStop(0.55, '#c09820');
+  tg.addColorStop(0.65, '#d8b840');
+  tg.addColorStop(0.78, '#f0e080');
+  tg.addColorStop(0.88, '#e0c850');
+  tg.addColorStop(1, '#907018');
+  ctx.fillStyle = tg;
+  ctx.fillText('HOMER', 960, 508);
+
+  // Thin bright edge on top for depth
+  ctx.strokeStyle = 'rgba(255,250,220,0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeText('HOMER', 960, 508);
+
+  // Subtitle
+  ctx.font = '600 28px "Arial", sans-serif';
+  ctx.letterSpacing = '12px';
+  ctx.fillStyle = '#687888';
+  ctx.fillText('H O M E   R U N   D E R B Y', 960, 558);
+
+  // Decorative line with baseball seam motif
+  ctx.strokeStyle = 'rgba(180,160,100,0.25)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(640, 574);
+  ctx.lineTo(1280, 574);
+  ctx.stroke();
+  // Seam decorations
+  ctx.strokeStyle = 'rgba(180,50,40,0.18)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let a = 0; a < 1; a += 0.08) {
+    const sx = 620 + a * 42 + Math.sin(a * 8) * 4;
+    if (a === 0) ctx.moveTo(sx, 574); else ctx.lineTo(sx, 574);
+  }
+  ctx.stroke();
+  ctx.beginPath();
+  for (let a = 0; a < 1; a += 0.08) {
+    const sx = 1260 + a * 42 + Math.sin(a * 8) * 4;
+    if (a === 0) ctx.moveTo(sx, 574); else ctx.lineTo(sx, 574);
+  }
+  ctx.stroke();
+
+  // Location
+  ctx.font = '600 16px Georgia, serif';
+  ctx.letterSpacing = '6px';
+  ctx.fillStyle = '#4a5565';
+  ctx.fillText('BUSCH STADIUM  \u2022  ST. LOUIS', 960, 602);
+
+  // Floating baseball
+  const ballY = 660 + Math.sin(t * 1.4) * 7;
+  drawBall3D(960, ballY, 24, t * 0.5);
+
+  // PLAY button
+  const btnW = 270, btnH = 64;
+  const btnX = 960 - btnW / 2, btnY = 722;
+
+  // Button shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.roundRect(btnX + 4, btnY + 4, btnW, btnH, 12);
+  ctx.fill();
+
+  // Button body with premium gradient
+  ctx.shadowColor = 'rgba(200,150,50,0.25)';
+  ctx.shadowBlur = 22;
+  const btnG = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnH);
+  btnG.addColorStop(0, '#c8a030');
+  btnG.addColorStop(0.3, '#b08820');
+  btnG.addColorStop(0.7, '#a08020');
+  btnG.addColorStop(1, '#806818');
+  ctx.fillStyle = btnG;
+  ctx.beginPath();
+  ctx.roundRect(btnX, btnY, btnW, btnH, 12);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Button highlight
+  ctx.strokeStyle = 'rgba(255,240,180,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(btnX, btnY, btnW, btnH, 12);
+  ctx.stroke();
+
+  ctx.font = 'bold 30px "Arial Black", sans-serif';
+  ctx.letterSpacing = '8px';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('P L A Y', 960, 762);
+
+  // Instructions
+  ctx.font = '14px Arial, sans-serif';
+  ctx.letterSpacing = '0px';
+  ctx.fillStyle = '#3a4555';
+  ctx.fillText('Tap to swing when the ball is in the strike zone', 960, 835);
+  ctx.fillText('3 rounds  \u2022  10 pitches each  \u2022  Hit as many homers as you can', 960, 858);
+
+  ctx.restore();
+
+  // Vignette on title
+  const vigG = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * 0.3, W/2, H/2, Math.max(W, H) * 0.72);
+  vigG.addColorStop(0, 'rgba(0,0,0,0)');
+  vigG.addColorStop(0.7, 'rgba(0,0,0,0)');
+  vigG.addColorStop(1, 'rgba(0,0,0,0.4)');
+  ctx.fillStyle = vigG;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ==============================================================
+// ROUND END SCREEN
+// ==============================================================
+
 function drawRoundEnd() {
   ctx.fillStyle = 'rgba(0,0,0,0.78)';
   ctx.fillRect(0, 0, W, H);
 
   ctx.textAlign = 'center';
 
-  // Title
-  ctx.font = 'bold 46px "Arial Black"';
-  const rg = ctx.createLinearGradient(700, 260, 700, 310);
+  ctx.font = 'bold 48px "Arial Black"';
+  const rg = ctx.createLinearGradient(700, 265, 700, 315);
   rg.addColorStop(0, '#fff');
   rg.addColorStop(1, '#ffcc00');
   ctx.fillStyle = rg;
   ctx.fillText('ROUND ' + (round - 1) + ' COMPLETE', 960, 300);
 
-  // Stats box
   ctx.fillStyle = 'rgba(0,0,0,0.4)';
   ctx.beginPath();
   ctx.roundRect(760, 330, 400, 200, 12);
@@ -1755,12 +2342,14 @@ function drawRoundEnd() {
   }
 }
 
-// ---- Game Over Screen ----
+// ==============================================================
+// GAME OVER SCREEN
+// ==============================================================
+
 function drawGameOver() {
   ctx.fillStyle = 'rgba(0,0,0,0.82)';
   ctx.fillRect(0, 0, W, H);
 
-  // Celebration fireworks
   if (totalHR >= 5 && Math.random() < 0.06) {
     spawnFirework(200 + Math.random() * 1520, 80 + Math.random() * 250);
   }
@@ -1768,40 +2357,38 @@ function drawGameOver() {
 
   ctx.textAlign = 'center';
 
-  ctx.font = 'italic bold 70px "Arial Black"';
-  const fG = ctx.createLinearGradient(700, 200, 700, 280);
+  ctx.font = 'italic bold 72px "Arial Black"';
+  const fG = ctx.createLinearGradient(700, 200, 700, 285);
   fG.addColorStop(0, '#f0e0b0');
   fG.addColorStop(0.5, '#ffcc00');
   fG.addColorStop(1, '#c8a030');
   ctx.fillStyle = fG;
   ctx.fillText('FINAL SCORE', 960, 270);
 
-  ctx.font = 'bold 110px "Arial Black"';
+  ctx.font = 'bold 115px "Arial Black"';
   ctx.shadowColor = 'rgba(255,200,50,0.4)';
-  ctx.shadowBlur = 30;
+  ctx.shadowBlur = 35;
   ctx.fillStyle = '#ffcc00';
-  ctx.fillText(totalHR, 960, 410);
+  ctx.fillText(totalHR, 960, 415);
   ctx.shadowBlur = 0;
 
-  ctx.font = 'bold 32px Arial';
+  ctx.font = 'bold 34px Arial';
   ctx.fillStyle = '#fff';
-  ctx.fillText('HOME RUNS', 960, 455);
+  ctx.fillText('HOME RUNS', 960, 460);
 
-  // Stats box
   ctx.fillStyle = 'rgba(0,0,0,0.3)';
   ctx.beginPath();
-  ctx.roundRect(810, 475, 300, 120, 10);
+  ctx.roundRect(810, 480, 300, 120, 10);
   ctx.fill();
 
   ctx.font = '22px Arial';
   ctx.fillStyle = '#8899aa';
-  let yy = 505;
+  let yy = 510;
   for (let i = 0; i < roundScores.length; i++) {
     ctx.fillText('Round ' + (i + 1) + ': ' + roundScores[i] + ' HR', 960, yy);
     yy += 32;
   }
 
-  // Rating
   let rating = '';
   if (totalHR >= 25) rating = 'LEGENDARY!';
   else if (totalHR >= 20) rating = 'INCREDIBLE!';
@@ -1810,12 +2397,11 @@ function drawGameOver() {
   else if (totalHR >= 5) rating = 'NICE!';
   else rating = 'KEEP PRACTICING!';
 
-  ctx.font = 'bold 36px "Arial Black"';
+  ctx.font = 'bold 38px "Arial Black"';
   ctx.fillStyle = totalHR >= 10 ? '#ffcc00' : '#8899aa';
   ctx.fillText(rating, 960, yy + 30);
 
-  // Play again button
-  const btnY = yy + 55;
+  const btnY = yy + 58;
   ctx.fillStyle = 'rgba(0,0,0,0.3)';
   ctx.beginPath();
   ctx.roundRect(833, btnY + 3, 260, 58, 10);
@@ -1832,36 +2418,41 @@ function drawGameOver() {
   ctx.fillText('PLAY AGAIN', 960, btnY + 37);
 }
 
-// ---- Pitch Logic ----
+// ==============================================================
+// COMBINED STADIUM SCENE
+// ==============================================================
+
+function drawStadiumScene() {
+  drawSky();
+  drawArch();
+  drawStadiumStructure();
+  drawScoreboard();
+  drawStadiumLights();
+  drawOutfieldWall();
+  drawField();
+  drawPitcher();
+}
+
+// ==============================================================
+// PITCH / SWING / GAME LOGIC
+// ==============================================================
+
 function startPitch() {
   if (pitchesLeft <= 0) return;
   const pt = randomPitch();
   const targetX = 935 + Math.random() * 50;
 
-  // Start windup
   windupPhase = 1;
   windupTimer = 0;
 
-  // Delay pitch until windup completes
   setTimeout(() => {
     windupPhase = 2;
     windupTimer = 0;
 
     pitch = {
-      t: 0,
-      speed: pt.speed,
-      curve: pt.curve,
-      mph: pt.mph,
-      name: pt.name,
-      startX: 960,
-      startY: 655,
-      targetX: targetX,
-      targetY: H - 50,
-      x: 960,
-      y: 655,
-      size: 4,
-      active: true,
-      rotation: 0
+      t: 0, speed: pt.speed, curve: pt.curve, mph: pt.mph, name: pt.name,
+      startX: 960, startY: 655, targetX: targetX, targetY: H - 50,
+      x: 960, y: 655, size: 4, active: true, rotation: 0
     };
     pitchSpeedDisplay = { text: pt.mph + ' MPH  ' + pt.name.toUpperCase(), timer: 90 };
     canSwing = true;
@@ -1876,8 +2467,6 @@ function startPitch() {
 function updatePitch(dt) {
   if (!pitch || !pitch.active) return;
   pitch.t += pitch.speed * dt;
-
-  // Ball rotation
   pitch.rotation += pitch.speed * dt * 15;
 
   if (pitch.t >= 1) {
@@ -1887,10 +2476,8 @@ function updatePitch(dt) {
       pitchesLeft--;
       canSwing = false;
       setTimeout(() => {
-        if (pitchesLeft > 0) {
-          state = 'playing';
-          startPitch();
-        } else endRound();
+        if (pitchesLeft > 0) { state = 'playing'; startPitch(); }
+        else endRound();
       }, 800);
     }
     return;
@@ -1899,9 +2486,7 @@ function updatePitch(dt) {
   const t = pitch.t;
   const easeT = t * t;
   pitch.x = pitch.startX + (pitch.targetX - pitch.startX) * t;
-  if (pitch.curve) {
-    pitch.x += Math.sin(t * Math.PI) * 40 * pitch.curve;
-  }
+  if (pitch.curve) pitch.x += Math.sin(t * Math.PI) * 40 * pitch.curve;
   pitch.y = pitch.startY + (pitch.targetY - pitch.startY) * easeT;
   pitch.size = 3 + easeT * 24;
 
@@ -1923,11 +2508,7 @@ function doSwing() {
     pitch.active = false;
     pitchesLeft--;
 
-    if (t < 0.5) {
-      strikeTimer = 60;
-      afterPitch();
-      return;
-    }
+    if (t < 0.5) { strikeTimer = 60; afterPitch(); return; }
 
     if (diff < 0.04) {
       const dist = 400 + Math.random() * 80;
@@ -1936,12 +2517,10 @@ function doSwing() {
     } else if (diff < 0.1) {
       const dist = 320 + Math.random() * 100;
       const angle = (t > sweetSpot ? 0.3 : -0.3) + Math.random() * 0.2;
-      const isHR = dist > 370;
-      launchHitBall(dist, angle, isHR);
+      launchHitBall(dist, angle, dist > 370);
     } else if (diff < 0.2) {
-      const angle = (t > sweetSpot ? 1.2 : -1.2);
       foulTimer = 60;
-      launchHitBall(150, angle, false);
+      launchHitBall(150, (t > sweetSpot ? 1.2 : -1.2), false);
     } else {
       if (t > 0.6) {
         foulTimer = 60;
@@ -1949,8 +2528,7 @@ function doSwing() {
       } else {
         strikeTimer = 60;
       }
-      afterPitch();
-      return;
+      afterPitch(); return;
     }
   }, 120);
 }
@@ -1958,17 +2536,12 @@ function doSwing() {
 function launchHitBall(distance, angle, isHR) {
   const speed = distance * 0.3;
   hitBall = {
-    x: 960,
-    y: H - 60,
-    z: 0,
+    x: 960, y: H - 60, z: 0,
     vx: Math.sin(angle) * speed * 0.3,
     vz: speed,
     vy: -speed * 0.4,
-    height: 0,
-    size: 18,
-    distance: distance,
-    isHR: isHR,
-    timer: 0
+    height: 0, size: 18, distance: distance,
+    isHR: isHR, timer: 0
   };
 
   lastHitDist = Math.round(distance);
@@ -2006,20 +2579,13 @@ function updateHitBall() {
   hitBall.vy += 0.5;
   hitBall.vz *= 0.99;
   hitBall.vx *= 0.99;
-
-  if (hitBall.height > 0 && hitBall.timer > 30) {
-    hitBall = null;
-  }
+  if (hitBall.height > 0 && hitBall.timer > 30) hitBall = null;
 }
 
 function afterPitch() {
   setTimeout(() => {
-    if (pitchesLeft > 0) {
-      state = 'playing';
-      startPitch();
-    } else {
-      endRound();
-    }
+    if (pitchesLeft > 0) { state = 'playing'; startPitch(); }
+    else endRound();
   }, 600);
 }
 
@@ -2027,24 +2593,20 @@ function endRound() {
   roundScores.push(homeRuns);
   totalHR += homeRuns;
   round++;
-  if (round > 3) {
-    state = 'gameOver';
-  } else {
-    state = 'roundEnd';
-  }
+  state = round > 3 ? 'gameOver' : 'roundEnd';
 }
 
-// ---- Main Loop ----
+// ==============================================================
+// MAIN GAME LOOP
+// ==============================================================
+
 let lastTime = 0;
 function gameLoop(timestamp) {
   const dt = Math.min(3, (timestamp - lastTime) / 16.67);
   lastTime = timestamp;
   frameCount++;
 
-  // Update windup timer
-  if (windupPhase > 0) {
-    windupTimer += dt;
-  }
+  if (windupPhase > 0) windupTimer += dt;
 
   ctx.save();
   if (shakeAmount > 0.5) {
@@ -2059,9 +2621,11 @@ function gameLoop(timestamp) {
     drawTitle();
   } else if (state === 'roundEnd') {
     drawStadiumScene();
+    applyPostProcessing();
     drawRoundEnd();
   } else if (state === 'gameOver') {
     drawStadiumScene();
+    applyPostProcessing();
     drawGameOver();
   } else {
     drawStadiumScene();
@@ -2078,10 +2642,10 @@ function gameLoop(timestamp) {
       drawHitBall();
     }
 
-    // Batter (over-the-shoulder view)
+    // Batter
     drawBatter();
 
-    // Bat
+    // Bat with swing
     let swingProg = -1;
     if (swingTime >= 0) {
       swingProg = Math.min(1, swingTime / 8);
@@ -2092,6 +2656,12 @@ function gameLoop(timestamp) {
 
     drawImpactFlash();
     drawParticles();
+
+    // Post-processing
+    applyPostProcessing();
+
+    // HUD and scorebug on top of post-processing
+    drawScorebug();
     drawHUD();
 
     updatePitch(dt);
@@ -2110,18 +2680,10 @@ function gameLoop(timestamp) {
   requestAnimationFrame(gameLoop);
 }
 
-function drawStadiumScene() {
-  drawSky();
-  drawArch();
-  drawStadiumStructure();
-  drawScoreboard();
-  drawStadiumLights();
-  drawOutfieldWall();
-  drawField();
-  drawPitcher();
-}
+// ==============================================================
+// INPUT HANDLING
+// ==============================================================
 
-// ---- Input ----
 function getCanvasCoords(e) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = W / rect.width;
@@ -2139,24 +2701,17 @@ function handleInput(e) {
   const pos = getCanvasCoords(e);
 
   if (state === 'title') {
-    if (pos.x > 830 && pos.x < 1090 && pos.y > 720 && pos.y < 782) {
-      startGame();
-    }
+    if (pos.x > 825 && pos.x < 1095 && pos.y > 722 && pos.y < 786) startGame();
   } else if (state === 'pitching') {
     doSwing();
   } else if (state === 'roundEnd') {
-    // Dynamic button position - check broad area
     if (pos.x > 800 && pos.x < 1120 && pos.y > 500 && pos.y < 700) {
-      homeRuns = 0;
-      pitchesLeft = 10;
-      consecutiveHR = 0;
-      state = 'playing';
-      startPitch();
+      homeRuns = 0; pitchesLeft = 10; consecutiveHR = 0;
+      state = 'playing'; startPitch();
     }
   } else if (state === 'gameOver') {
     if (pos.x > 800 && pos.x < 1120 && pos.y > 600 && pos.y < 800) {
-      resetGame();
-      startGame();
+      resetGame(); startGame();
     }
   }
 }
@@ -2166,18 +2721,11 @@ canvas.addEventListener('touchstart', handleInput, { passive: false });
 document.body.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
 
 function startGame() {
-  round = 1;
-  pitchesLeft = 10;
-  homeRuns = 0;
-  totalHR = 0;
-  roundScores = [];
-  consecutiveHR = 0;
-  particles = [];
-  fireworks = [];
-  windupPhase = 0;
-  windupTimer = 0;
-  state = 'playing';
-  startPitch();
+  round = 1; pitchesLeft = 10; homeRuns = 0; totalHR = 0;
+  roundScores = []; consecutiveHR = 0;
+  particles = []; fireworks = [];
+  windupPhase = 0; windupTimer = 0;
+  state = 'playing'; startPitch();
 }
 
 function resetGame() {
